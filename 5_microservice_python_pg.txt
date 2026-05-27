@@ -1,0 +1,492 @@
+Практика 5: Микросервис на Python + PostgreSQL с CI/CD (от простого к сложному)
+Цель этой практики – создать работающий фундамент: REST API на Python (FastAPI) с PostgreSQL, упаковать в Docker, настроить GitLab CI/CD для линтинга, тестирования с реальной БД и сборки образа.
+В следующих практиках мы добавим миграции Alembic, асинхронность, деплой на staging/production. Сейчас – только необходимое, что гарантированно работает.
+
+Предварительные требования
+Завершены практики 1–4: установлены GitLab, Docker, GitLab Runner (с executor docker и shell), включён Container Registry. Все действия выполняются на той же ВМ (Debian/Ubuntu).
+
+Шаг 1. Установка Python
+bash
+sudo apt update
+sudo apt install python3 python3-pip python3-venv -y
+python3 --version
+
+Шаг 2. Создание проекта
+
+mkdir ~/notes-api
+cd ~/notes-api
+python3 -m venv venv
+source venv/bin/activate
+
+Создайте requirements.txt:
+
+
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+pytest
+httpx
+Установите:
+
+
+pip install -r requirements.txt
+Шаг 3. Пишем приложение 
+Создайте app.py:
+
+import os
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy import create_engine, Column, Integer, String, Text
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from pydantic import BaseModel 
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/notesdb")
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class Note(Base):
+    __tablename__ = "notes"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(100), nullable=False)
+    content = Column(Text, nullable=True)
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Notes API (simple)")
+
+class NoteCreate(BaseModel):
+    title: str
+    content: str = None
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@app.post("/notes/")
+def create_note(note_data: NoteCreate, db: Session = Depends(get_db)):
+    note = Note(title=note_data.title, content=note_data.content)
+    db.add(note)
+    db.commit()
+    db.refresh(note)
+    return note
+
+@app.get("/notes/{note_id}")
+def read_note(note_id: int, db: Session = Depends(get_db)):
+    note = db.query(Note).filter(Note.id == note_id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    return note
+
+@app.get("/notes/")
+def list_notes(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    notes = db.query(Note).offset(skip).limit(limit).all()
+    return notes
+
+@app.delete("/notes/{note_id}")
+def delete_note(note_id: int, db: Session = Depends(get_db)):
+    note = db.query(Note).filter(Note.id == note_id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    db.delete(note)
+    db.commit()
+    return {"ok": True}
+
+
+Base.metadata.create_all автоматически создаёт таблицы при запуске – для прототипа и тестов этого достаточно.
+Позже мы заменим это на Alembic, но сначала убедимся, что всё работает.
+
+Шаг 4. Тесты (синхронные, с реальной БД)
+Создайте папку tests и файл tests/test_api.py:
+
+
+from fastapi.testclient import TestClient
+from app import app
+
+client = TestClient(app)
+
+def test_create_note():
+    response = client.post("/notes/", json={"title": "Test", "content": "Hello"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["title"] == "Test"
+    assert "id" in data
+
+def test_get_note():
+    # Сначала создадим заметку
+    create_resp = client.post("/notes/", json={"title": "Get me", "content": "Content"})
+    note_id = create_resp.json()["id"]
+
+    get_resp = client.get(f"/notes/{note_id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["title"] == "Get me"
+
+def test_list_notes():
+    resp = client.get("/notes/")
+    assert resp.status_code == 200
+    assert isinstance(resp.json(), list)
+
+def test_delete_note():
+    create_resp = client.post("/notes/", json={"title": "To delete", "content": "xxx"})
+    note_id = create_resp.json()["id"]
+    del_resp = client.delete(f"/notes/{note_id}")
+    assert del_resp.status_code == 200
+    # Проверяем, что заметки больше нет
+    get_resp = client.get(f"/notes/{note_id}")
+    assert get_resp.status_code == 404
+Тесты синхронные, используют встроенный TestClient из FastAPI. Они будут работать, если база данных поднята и таблицы созданы.
+создайте в корне проекта файл pytest.ini
+[pytest]
+pythonpath = .
+
+
+Шаг 5. Dockerfile
+
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+Создайте .dockerignore:
+
+venv
+__pycache__
+.git
+.gitlab-ci.yml
+*.pyc
+
+
+Шаг 6. docker-compose.yml для локальной разработки
+
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: notesdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/notesdb
+    depends_on:
+      - db
+
+volumes:
+  postgres_data:
+
+Локально запуск:
+docker compose up -d db
+docker compose up app
+# или сразу оба: docker compose up
+
+Шаг 7. GitLab CI/CD (минимальный работающий пайплайн)
+Прежде чем писать пайплайн, нам нужно решить одну важную архитектурную задачу. По умолчанию для сборки Docker-образов используют технологию Docker-in-Docker (DinD). Однако в локальных установках с самоподписанными сертификатами DinD приводит к ошибкам x509 (недоверие сертификату) при попытке запушить образ в Registry.
+
+Поскольку GitLab и Runner работают на одной ВМ, мы используем более простой и надёжный подход — **Docker Socket Binding**. Мы разрешим раннеру использовать Docker-демон самой виртуалки. Это быстрее и полностью избавляет от проблем с сертификатами.
+
+Для этого выполните два подготовительных шага на вашей ВМ:
+
+1. Добавьте сертификат GitLab в доверенные для локального Docker-демона (чтобы он мог пушить образы):
+
+sudo mkdir -p /etc/docker/certs.d/gitlab.local:5050
+sudo cp /etc/gitlab/ssl/gitlab.local.crt /etc/docker/certs.d/gitlab.local:5050/ca.crt
+sudo systemctl restart docker
+
+
+2. Настройте GitLab Runner на использование сокета хоста. Откройте конфигурацию раннера:
+
+sudo nano /etc/gitlab-runner/config.toml
+Найдите секцию [runners.docker] и добавьте монтирование сокета и папки с сертификатами в строку volumes:
+toml
+[[runners]]
+  ...
+  [runners.docker]
+    ...
+    volumes = ["/cache", "/var/run/docker.sock:/var/run/docker.sock", "/etc/docker/certs.d:/etc/docker/certs.d:ro"]
+Сохраните файл и перезапустите раннер: sudo gitlab-runner restart.
+
+Теперь создайте файл .gitlab-ci.yml:
+
+stages:
+  - lint
+  - test
+  - build
+
+variables:
+  POSTGRES_DB: notesdb
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  DATABASE_URL: postgresql://postgres:postgres@postgres:5432/notesdb
+
+lint:
+  stage: lint
+  image: python:3.11-slim
+  tags:
+    - docker
+  script:
+    - pip install flake8
+    - flake8 app.py tests/
+
+test:
+  stage: test
+  image: python:3.11-slim
+  tags:
+    - docker
+  services:
+    - postgres:15-alpine
+  before_script:
+    - apt-get update && apt-get install -y wait-for-it
+    - pip install -r requirements.txt
+    - wait-for-it postgres:5432 --timeout=30
+  script:
+    - pytest tests/ -v
+
+build:
+  stage: build
+  tags:
+    - docker
+  image: docker:latest
+  # Нам не нужен сервис docker:dind, так как мы используем сокет хоста
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:latest .
+    - docker push $CI_REGISTRY_IMAGE:latest
+  only:
+    - main
+
+Что здесь важно:
+В этапе test мы поднимаем PostgreSQL как сервис GitLab.
+wait-for-it ждёт, пока база не будет готова принимать соединения.
+Приложение запускается внутри тестов (через TestClient), и Base.metadata.create_all создаёт таблицы в этой временной БД.
+В этапе build мы используем сокет хоста. Это избавляет от необходимости поднимать тяжёлый и капризный docker:dind, а также решает проблемы с сертификатами при пуше в локальный Registry. Сборка происходит только для ветки main и только после успешных тестов.
+
+Шаг 8. Проверка локально перед коммитом
+
+# Запустите тесты локально (требуется работающий PostgreSQL)
+# Либо поднимите БД через docker-compose:
+docker compose up -d db
+export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/notesdb
+pytest tests/ -v
+Исправьте ошибки, если есть.
+
+Шаг 9. Отправка в GitLab
+bash
+git init
+git remote add origin git@gitlab.local:root/notes-api.git
+git add .
+git commit -m "Simple working Python microservice with PostgreSQL"
+git push -u origin main
+Перейдите в веб-интерфейс GitLab → проект → CI/CD → Pipelines. Вы увидите падение пайплана, потому что код не пройдёт проверку линтера
+
+То, что вы видите сейчас — это **не ошибка пайплайна, а успешная работа линтера**. Линтер `flake8` проверил ваш код на соответствие стандартам оформления Python (PEP 8) и нашёл нарушения. Так как он нашёл ошибки, он завершился с кодом 1 (exit code 1), что GitLab воспринимает как "упавшую" джобу. Это правильное поведение CI/CD: код со стилистическими ошибками не должен проходить пайплайн.
+
+Вот что именно не понравилось `flake8`:
+*   **E501 line too long** — строки длиннее 79 символов (стандарт PEP 8).
+*   **E302 expected 2 blank lines** — перед объявлением функции или класса должно быть 2 пустые строки, а у вас 1.
+*   **E305 expected 2 blank lines** — после объявления класса/функции должно быть 2 пустые строки.
+*   **W291 trailing whitespace** — лишние пробелы в конце строки.
+*   **W292 no newline at end of file** — в конце файла обязательно нужно нажать Enter (пустая строка в конце).
+
+
+Вам нужно отформатировать файлы `app.py` и `tests/test_api.py` по правилам PEP 8. Вот уже исправленные версии:
+
+app.py:
+import os
+
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy import create_engine, Column, Integer, String, Text
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from pydantic import BaseModel
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@db:5432/notesdb"
+)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+class Note(Base):
+    __tablename__ = "notes"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(100), nullable=False)
+    content = Column(Text, nullable=True)
+
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Notes API (simple)")
+
+
+class NoteCreate(BaseModel):
+    title: str
+    content: str = None
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@app.post("/notes/")
+def create_note(note_data: NoteCreate, db: Session = Depends(get_db)):
+    note = Note(title=note_data.title, content=note_data.content)
+    db.add(note)
+    db.commit()
+    db.refresh(note)
+    return note
+
+
+@app.get("/notes/{note_id}")
+def read_note(note_id: int, db: Session = Depends(get_db)):
+    note = db.query(Note).filter(Note.id == note_id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    return note
+
+
+@app.get("/notes/")
+def list_notes(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    notes = db.query(Note).offset(skip).limit(limit).all()
+    return notes
+
+
+@app.delete("/notes/{note_id}")
+def delete_note(note_id: int, db: Session = Depends(get_db)):
+    note = db.query(Note).filter(Note.id == note_id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    db.delete(note)
+    db.commit()
+    return {"ok": True}
+
+
+tests/test_api.py:
+from fastapi.testclient import TestClient
+
+from app import app
+
+client = TestClient(app)
+
+
+def test_create_note():
+    response = client.post(
+        "/notes/",
+        json={"title": "Test", "content": "Hello"}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["title"] == "Test"
+    assert "id" in data
+
+
+def test_get_note():
+    # Сначала создадим заметку
+    create_resp = client.post(
+        "/notes/",
+        json={"title": "Get me", "content": "Content"}
+    )
+    note_id = create_resp.json()["id"]
+
+    get_resp = client.get(f"/notes/{note_id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["title"] == "Get me"
+
+
+def test_list_notes():
+    resp = client.get("/notes/")
+    assert resp.status_code == 200
+    assert isinstance(resp.json(), list)
+
+
+def test_delete_note():
+    create_resp = client.post(
+        "/notes/",
+        json={"title": "To delete", "content": "xxx"}
+    )
+    note_id = create_resp.json()["id"]
+    del_resp = client.delete(f"/notes/{note_id}")
+    assert del_resp.status_code == 200
+    # Проверяем, что заметки больше нет
+    get_resp = client.get(f"/notes/{note_id}")
+    assert get_resp.status_code == 404
+
+Снова отправьте код в репозиторий:
+git add .
+git commit -m "Refactoring"
+git push
+
+Шаг 10. Проверка результата
+Пайплайн зелёный, но давайте убедимся, что образ реально попал в Container Registry и работает.
+
+1. Проверка в веб-интерфейсе:
+   Перейдите в ваш проект в GitLab → боковое меню Deploy → Container Registry. Вы должны увидеть репозиторий `notes-api` с тегом `latest`. 
+
+2. Запуск образа на сервере:
+   Теперь этот образ можно скачать и запустить на любой машине, имеющей доступ к вашему GitLab. Давайте проверим это на самой ВМ.
+   Убедитесь, что база данных из Шага 6 всё ещё работает:
+   docker compose -f ~/notes-api/docker-compose.yml up -d db
+   
+   Авторизуйтесь в локальном Registry (используйте ваш логин/пароль от GitLab или Access Token):
+   docker login gitlab.local:5050
+   
+   Скачайте собранный образ:
+   docker pull gitlab.local:5050/root/notes-api:latest
+   
+   Запустите его, связав с локальной БД (мы используем `--network host`, чтобы контейнер мог достучаться до БД на `localhost`):
+   docker run -d --name notes-app-ci \
+     --network host \
+     -e DATABASE_URL="postgresql://postgres:postgres@localhost:5432/notesdb" \
+     gitlab.local:5050/root/notes-api:latest
+
+   Проверьте, что API отвечает:
+
+   curl http://localhost:8000/notes/
+   Если в ответ пришёл пустой список `[]` — всё работает идеально! Образ из CI/CD успешно скачан и функционирует.
+   Не забудьте остановить тестовый контейнер: `docker rm -f notes-app-ci`.
+
+
+
+Заключение: Чего не хватает для взрослого пайплайна?
+Мы создали надёжный фундамент: код проверяется, тестируется с реальной БД, упаковывается и сохраняется в Registry. Но до полноценного Production-конвейера ещё далеко. Вот список того, что мы добавим в следующих практиках:
+1. *Миграции базы данных (Alembic)
+   Сейчас таблицы создаёт `Base.metadata.create_all`. Это работает только для создания с нуля. Если вы добавите новую колонку в модель, этот метод её не добавит в существующую таблицу. Нужен инструмент версионирования схемы БД (миграций) — Alembic.
+
+2. Версионирование Docker-образов (Тегирование)
+   Мы пушим образ с тегом `latest`. В продакшене это антипаттерн: если что-то сломается, вы не сможете откатиться на предыдущую версию, потому что старый образ был перезаписан. Нам нужно тегировать образы по хешу коммита (`$CI_COMMIT_SHORT_SHA`) или семантической версии (`v1.2.3`).
+
+3. Кэширование зависимостей
+   Каждый раз пайплайн выполняет `pip install` с нуля, а `docker build` заново скачивает базовые слои. Это тратит время и ресурсы. Нам понадобится настроить кэширование GitLab CI для `pip` и использовать `--cache-from` для Docker.
+
+4. Безопасность (Сканирование уязвимостей)
+   Мы не проверяем образ на известные CVE-уязвимости. В продакшене обязательно добавлять этап Security Scanning (например, с помощью Trivy или встроенного GitLab SAST/Container Scanning), который не пропустит образ с критическими уязвимостями.
+
+5. Стадии Staging и Production (CD - Continuous Delivery/Deployment)
+   Сборка образа — это только CI. Настоящий пайплайн должен автоматически раскатывать образ на Staging-сервер для ручного теста, а затем (по кнопке или автоматически) — на Production. Для этого понадобятся GitLab Environments и настройка раннеров на целевых серверах.
+
+6. Асинхронность
+   FastAPI создан для асинхронного кода, а наше приложение и тесты используют синхронный драйвер `psycopg2`. Для высоких нагрузок нужно переходить на `asyncpg` и асинхронную версию SQLAlchemy.
+Сейчас у вас есть работающий скелет. В следующих практиках мы будем наращивать на него мышцы, шаг за шагом превращая его в надёжную систему уровня Enterprise.
+
+

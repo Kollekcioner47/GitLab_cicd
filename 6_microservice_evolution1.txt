@@ -1,0 +1,329 @@
+Практика 6: Веб-интерфейс на Go, версионирование и деплой Staging
+
+Цель: Добавить к нашему API веб-интерфейс, написанный на Go, который будет проксировать запросы к бэкенду. Научиться собирать полиглот-приложение (несколько языков в одном репозитории), тегировать Docker-образы по хешу коммита и автоматически разворачивать Staging-окружение с помощью Docker Compose.
+
+Шаг 1. Подготовка структуры проекта
+Мы преобразуем наш проект в монорепозиторий. Создайте в корне проекта папку `web-ui`, а текущие файлы Python перенесите в папку `api`. Структура должна выглядеть так:
+
+notes-api/
+├── api/
+│   ├── app.py
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── tests/
+│       └── test_api.py
+├── web-ui/
+│   ├── main.go
+│   ├── web/
+│   │   └── index.html
+│   └── Dockerfile
+├── docker-compose.yml
+└── .gitlab-ci.yml
+
+Примечание: Не забудьте обновить путь к приложению в `api/tests/test_api.py`: `from api.app import app` (вместо `from app import app`), а в `api/Dockerfile` изменить `COPY . .` на `COPY api/ .` или настроить контекст сборки (мы сделаем это через CI).
+
+Шаг 2. Пишем веб-интерфейс на Go
+
+Go будет работать как легковесный веб-сервер: отдавать статические файлы (HTML/JS) из папки `web/` и проксировать запросы, начинающиеся с `/api/`, на наш Python-бэкенд. Это избавит нас от проблем с CORS.
+
+Создайте файл `web-ui/main.go`:
+
+package main
+
+import (
+	"log"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+)
+
+func main() {
+	// Адрес бэкенда берем из переменной окружения, по умолчанию http://app:8000
+	backendURL, _ := url.Parse(getEnv("API_URL", "http://app:8000"))
+	proxy := httputil.NewSingleHostReverseProxy(backendURL)
+
+	// Проксируем запросы /api/ на бэкенд (обрезая префикс /api)
+	http.Handle("/api/", http.StripPrefix("/api", proxy))
+
+	// Отдаем статику из папки ./web
+	fs := http.FileServer(http.Dir("./web"))
+	http.Handle("/", fs)
+
+	log.Println("Frontend UI starting on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
+
+*(Внимание: добавьте `import "os"` в блок импорта, так как мы используем `os.LookupEnv`)*
+
+Создайте простейший интерфейс `web-ui/web/index.html`:
+
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Notes App</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; }
+        .note { border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; border-radius: 5px; }
+        form { margin-bottom: 20px; }
+        input, textarea { width: 100%; margin-bottom: 5px; padding: 8px; }
+    </style>
+</head>
+<body>
+    <h1>Мои Заметки</h1>
+    <form id="noteForm">
+        <input type="text" id="title" placeholder="Заголовок" required>
+        <textarea id="content" placeholder="Текст заметки"></textarea>
+        <button type="submit">Добавить</button>
+    </form>
+    <div id="notesList"></div>
+
+    <script>
+        const API_URL = '/api/notes/';
+
+        async function fetchNotes() {
+            const res = await fetch(API_URL);
+            const notes = await res.json();
+            document.getElementById('notesList').innerHTML = notes.map(n => 
+                `<div class="note"><b>${n.title}</b><p>${n.content || ''}</p></div>`
+            ).join('');
+        }
+
+        document.getElementById('noteForm').onsubmit = async (e) => {
+            e.preventDefault();
+            await fetch(API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    title: document.getElementById('title').value,
+                    content: document.getElementById('content').value
+                })
+            });
+            document.getElementById('title').value = '';
+            document.getElementById('content').value = '';
+            fetchNotes();
+        };
+
+        fetchNotes();
+    </script>
+</body>
+</html>
+
+
+Шаг 3. Dockerfile для Go (Multi-stage build)
+
+Одно из главных преимуществ Go — компиляция в один бинарник. Мы используем многоэтапную сборку, чтобы итоговый образ весил копейки.
+
+Создайте `web-ui/Dockerfile`:
+
+# Этап 1: Сборка
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY main.go .
+RUN CGO_ENABLED=0 GOOS=linux go build -o server main.go
+
+# Этап 2: Запуск (используем пустой образ scratch)
+FROM alpine:latest
+WORKDIR /app
+COPY --from=builder /app/server .
+COPY web ./web
+EXPOSE 8080
+CMD ["./server"]
+
+
+Шаг 4. Обновляем docker-compose.yml
+
+Теперь у нас три сервиса: БД, API и Web UI. Обновите корневой `docker-compose.yml`:
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: notesdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  app:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/notesdb
+    depends_on:
+      - db
+
+  web:
+    build: ./web-ui
+    ports:
+      - "8080:8080"
+    environment:
+      API_URL: http://app:8000
+    depends_on:
+      - app
+
+volumes:
+  postgres_data:
+
+Обратите внимание: порт 8080 проброшен только на веб-интерфейс. Python API скрыт внутри docker-сети и доступен только через Go-прокси.
+
+Шаг 5. Обновляем .gitlab-ci.yml (Версионирование и Staging)
+
+Здесь мы делаем два важных скачка:
+1. Версионирование: Используем переменную `$CI_COMMIT_SHORT_SHA` для тегирования образов. Это позволяет точно знать, какой коммит развернут.
+2. Staging Deploy: Добавляем стадию деплоя, которая запускает приложение на сервере через Docker Compose.
+
+stages:
+  - lint
+  - test
+  - build
+  - deploy_staging
+
+variables:
+  POSTGRES_DB: notesdb
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  DATABASE_URL: postgresql://postgres:postgres@postgres:5432/notesdb
+  DOCKER_TAG: $CI_COMMIT_SHORT_SHA  # Тегуем образом по хешу коммита!
+
+lint:
+  stage: lint
+  image: python:3.11-slim
+  tags:
+    - docker
+  script:
+    - pip install flake8
+    - flake8 api/app.py api/tests/
+  allow_failure: true  # Пока даем слабину линтеру, чтобы не мешал
+
+test:
+  stage: test
+  image: python:3.11-slim
+  tags:
+    - docker
+  services:
+    - postgres:15-alpine
+  before_script:
+    - apt-get update && apt-get install -y wait-for-it
+    - pip install -r api/requirements.txt
+    - wait-for-it postgres:5432 --timeout=30
+  script:
+    - cd api && pytest tests/ -v
+
+build_api:
+  stage: build
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE/api:$DOCKER_TAG -t $CI_REGISTRY_IMAGE/api:latest ./api
+    - docker push $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
+    - docker push $CI_REGISTRY_IMAGE/api:latest
+
+build_ui:
+  stage: build
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE/web:$DOCKER_TAG -t $CI_REGISTRY_IMAGE/web:latest ./web-ui
+    - docker push $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
+    - docker push $CI_REGISTRY_IMAGE/web:latest
+
+deploy_staging:
+  stage: deploy_staging
+  tags:
+    - cd
+  variables:
+    API_IMAGE: $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
+    WEB_IMAGE: $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - echo "Deploying version $DOCKER_TAG to Staging"
+    - docker compose -f docker-compose.staging.yml down || true
+    - docker compose -f docker-compose.staging.yml up -d
+  environment:
+    name: staging
+    url: http://gitlab.local:8088 
+
+
+Шаг 6. Создаем docker-compose.staging.yml
+
+Чтобы Shell-раннер мог развернуть наше приложение, используя образы из GitLab Container Registry, создадим отдельный Compose-файл для Staging. Он будет подхватывать переменные окружения из CI.
+
+Создайте файл `docker-compose.staging.yml` в корне проекта:
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: notesdb
+    volumes:
+      - postgres_data_staging:/var/lib/postgresql/data
+
+  app:
+    image: ${API_IMAGE}
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/notesdb
+    depends_on:
+      - db
+
+  web:
+    image: ${WEB_IMAGE}
+    ports:
+      - "8088:8080"   # <--- ИЗМЕНИЛИ ЗДЕСЬ: 8080 на 8088
+    environment:
+      API_URL: http://app:8000
+    depends_on:
+      - app
+
+volumes:
+  postgres_data_staging:
+
+Шаг 7. Коммитим и пушим
+
+Перед пушем не забудьте создать/обновить `.dockerignore` в корне проекта:
+venv
+__pycache__
+.git
+.gitlab-ci.yml
+*.pyc
+
+
+Отправляем изменения:
+
+git add .
+git commit -m "Add Go web UI, versioning and staging deploy"
+git push origin main
+
+
+Шаг 8. Проверка работы
+
+1. Зайдите в GitLab → CI/CD → Pipelines. Вы увидите 4 стадии.
+2. После успешного прохождения `build_api` и `build_ui`, перейдите в **Deploy → Container Registry**. Вы увидите две папки (`api` и `web`), в каждой из которых будут образы с тегом в виде короткого хеша коммита (например, `a1b2c3d4`) и тегом `latest`.
+3. Когда джоба `deploy_staging` отработает, откройте в браузере: **http://gitlab.local:8080**
+4. Вы увидите ваш интерфейс! Попробуйте создать заметку — она сохранится в базе данных через API.
+
+Чего мы добились (Резюме практики 6)
+
+1. Полиglot-архитектура: Мы объединили в одном пайплайне Python и Go. Это демонстрирует гибкость GitLab CI/CD.
+2. Версионирование (отказ от `latest`): Теперь каждый образ помечен хешем коммита. Если в production возникнет проблема, вы всегда можете откатиться, запустив контейнер с предыдущим хешем. `latest` используется только для удобства скачивания "самого свежего".
+3. Reverse Proxy: Мы решили проблему CORS (Cross-Origin Resource Sharing) на уровне инфраструктуры, заставив Go проксировать запросы. И фронтенд, и бэкенд теперь живут на одном домене/порту с точки зрения браузера.
+4. Автоматический Staging: Каждое изменение в ветке `main` автоматически разворачивается на сервере для ручного тестирования (Continuous Delivery).
+
+В следующей практике мы можем добавить ручной деплой в Production, научимся работать с миграциями базы данных (Alembic), чтобы не терять данные при пересоздании контейнеров, и добавим кэширование для ускорения пайплайна!

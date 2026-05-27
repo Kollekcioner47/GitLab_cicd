@@ -1,0 +1,140 @@
+устанавливаем базовый git
+sudo apt install git -y
+
+Инструкция по установке - https://docs.gitlab.com/install/package/debian/
+нам нужно установить curl:
+sudo apt install -y curl
+
+# ------------------------------------------------------------
+# 1. Генерация самоподписанного сертификата с поддержкой SAN (для совместимости с Go/gitlab-runner)
+# ------------------------------------------------------------
+# Создаём директорию для сертификатов GitLab
+sudo mkdir -p /etc/gitlab/ssl
+sudo chmod 755 /etc/gitlab/ssl
+
+# Создаём конфигурационный файл OpenSSL
+cat <<EOF | sudo tee /etc/gitlab/ssl/openssl-san.cnf
+[req]
+default_bits = 2048
+distinguished_name = req_distinguished_name
+req_extensions = req_ext
+prompt = no
+
+[req_distinguished_name]
+CN = gitlab.local
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = gitlab.local
+DNS.2 = localhost
+IP.1 = 127.0.0.1
+IP.2 = 10.0.2.5
+EOF
+
+# Генерируем закрытый ключ и сертификат с SAN
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/gitlab/ssl/gitlab.local.key \
+  -out /etc/gitlab/ssl/gitlab.local.crt \
+  -config /etc/gitlab/ssl/openssl-san.cnf \
+  -extensions req_ext
+
+# Устанавливаем правильные права
+sudo chmod 600 /etc/gitlab/ssl/gitlab.local.*
+sudo chmod 755 /etc/gitlab/ssl
+
+# 2. Скопируем сертификат 
+sudo cp /etc/gitlab/ssl/gitlab.local.crt /usr/local/share/ca-certificates/gitlab-local.crt
+sudo chmod 644 /usr/local/share/ca-certificates/gitlab-local.crt
+
+ обновим хранилище
+sudo update-ca-certificates --verbose --fresh
+
+Проверим, добавился ли сертификат в ca-certificates.crt
+sudo grep -A 5 "gitlab.local" /etc/ssl/certs/ca-certificates.crt
+
+# ------------------------------------------------------------
+# 2. Установка GitLab с поддержкой HTTPS
+# ------------------------------------------------------------
+# Скачиваем скрипт установки (здесь официальный репозиторий имеет валидный сертификат, 
+# но для самоподписанного на стороне клиента он не нужен, оставляем как есть)
+echo "ipv4" | sudo tee /etc/curlrc
+
+curl --location "https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh" | sudo bash
+
+# Устанавливаем GitLab, указав HTTPS URL
+sudo EXTERNAL_URL="https://gitlab.local" apt install gitlab-ce -y
+
+# ------------------------------------------------------------
+# 3. Настройка GitLab для использования самоподписанного сертификата
+# ------------------------------------------------------------
+# Открываем конфиг GitLab
+sudo nano /etc/gitlab/gitlab.rb
+
+# Добавляем (или раскомментируем) следующие строки:
+# external_url "https://gitlab.local"
+nginx['ssl_certificate'] = "/etc/gitlab/ssl/gitlab.local.crt"
+nginx['ssl_certificate_key'] = "/etc/gitlab/ssl/gitlab.local.key"
+nginx['ssl_verify_client'] = "off"
+nginx['ssl_verify_depth'] = 1
+
+# Применяем изменения
+sudo gitlab-ctl reconfigure
+sudo gitlab-ctl restart nginx
+
+# ------------------------------------------------------------
+# 4. Добавляем самоподписанный сертификат в доверенные на хосте
+# ------------------------------------------------------------
+# Копируем сертификат в директорию доверенных CA (для Debian/Ubuntu)
+sudo cp /etc/gitlab/ssl/gitlab.local.crt /usr/local/share/ca-certificates/gitlab-local.crt
+sudo chmod 644 /usr/local/share/ca-certificates/gitlab-local.crt
+
+# Обновляем хранилище доверенных сертификатов
+sudo update-ca-certificates --fresh
+
+# Проверяем, что теперь curl и git доверяют нашему GitLab без ключа -k
+curl https://gitlab.local --verbose 2>&1 | grep "SSL certificate verify ok"
+
+# ------------------------------------------------------------
+# 5. Временный пароль администратора
+# ------------------------------------------------------------
+# GitLab генерирует случайный пароль и хранит его в файле /etc/gitlab/initial_root_password
+# в течение 24 часов. По истечении 24 часов файл удаляется.
+echo "Пароль root:"
+sudo cat /etc/gitlab/initial_root_password | grep Password
+
+# ------------------------------------------------------------
+# 8. Регистрация раннера (теперь без --insecure, т.к. сертификат доверенный)
+# ------------------------------------------------------------
+# Перейдите в браузере по адресу https://gitlab.local (браузер может показать предупреждение — 
+# это нормально для самоподписанного сертификата, добавьте исключение)
+# Логин: root, пароль из файла /etc/gitlab/initial_root_password
+# В правом верхнем углу портала нажмите "Admin"
+# В админке перейдите в раздел CI/CD -> Runners
+# Нажмите ссылку "Still using registration tokens?" — скопируйте токен.
+
+# Зарегистрируйте runner (теперь сертификат доверенный, флаг --insecure не нужен)
+sudo gitlab-runner register \
+  --url https://gitlab.local/ \
+  --registration-token <ваш_токен>
+
+# Во время диалога:
+# Enter the GitLab instance URL: https://gitlab.local/
+# Enter the registration token: <вставьте токен>
+# Enter a description for the runner: cd
+# Enter tags for the runner: cd
+# Enter optional maintenance note: (просто нажмите Enter)
+# Enter executor: shell
+
+# ------------------------------------------------------------
+# 9. Настройка SSH-аутентификации
+# ------------------------------------------------------------
+# Создайте ключ SSH (если ещё нет)
+ssh-keygen 
+
+# Выведите публичный ключ
+cat /home/engineer/.ssh/id_ed25519.pub
+
+# Зайдите в профиль пользователя на портале GitLab (https://gitlab.local)
+# В меню "Access" -> "SSH Keys" -> добавьте ключ

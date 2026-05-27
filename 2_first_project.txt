@@ -1,0 +1,79 @@
+установим Apache для запуска web-сайта
+sudo apt install apache2 -y
+
+поправим порт по умолчанию:
+sudo nano /etc/apache2/ports.conf
+Listen 81
+sudo systemctl restart apache2
+
+подготовим папку проекта:
+mkdir simple-site
+cd simple-site
+git config --global user.name "Ваше имя"
+git config --global user.email ваш_email
+git config --global init.defaultBranch main
+git init
+
+sudo -i
+visudo
+добавляем
+gitlab-runner ALL=(ALL) NOPASSWD: ALL
+сохраняем
+logout
+
+Создаём проект
+
+В веб-интерфейсе GitLab:
+Новый проект -> create blank project
+
+Имя simple-site
+project url выбираем раздел root
+для простоты убираем галочку create readme
+
+
+копируем команды инициализации репозитория:
+git remote add origin git@gitlab.local:root/simple-site.git
+git branch -M main
+git push -uf origin main
+
+
+теперь создаем файлы проекта:
+index.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>My Site</title>
+</head>
+<body>
+    <h1>Hello from GitLab CI/CD</h1>
+</body>
+</html>
+
+.gitlab-ci.yml
+stages:
+  - test
+  - deploy
+
+test_html:
+  stage: test
+  tags:
+    - test
+  script:
+    - echo "Проверяем наличие index.html"
+    - test -f index.html
+
+deploy_to_apache:
+  stage: deploy
+  tags:
+    - test
+  script:
+    - echo "Deploy в Apache"
+    - sudo cp index.html /var/www/html/index.html
+  only:
+    - main
+
+
+git add *
+git commit -m "First deploy"
+
+проверяем в браузере localhost:81

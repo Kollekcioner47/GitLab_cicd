@@ -1,0 +1,505 @@
+Практика 7: Ускоряем пайплайн и защищаем проект (Cache & Security)
+В этой практике мы научимся:
+1. Кэшировать Python-зависимости, чтобы `pip install` не скачивал пакеты из интернета каждый раз.
+2. Кэшировать слои Docker, чтобы пересобирался только измененный код, а не базовые образы.
+3. Использовать Trivy — индустриальный стандарт для поиска уязвимостей (CVE) в контейнерах и зависимостях. Если найдем критическую дыру — пайплайн покраснеет и не пустит код в Staging!
+
+Цель: Научиться управлять кэшем GitLab CI для ускорения сборок и внедрить автоматическую проверку безопасности Docker-образов с помощью Trivy.
+
+Шаг 1. Настраиваем кэширование Python
+
+Каждый раз в стадиях `lint` и `test` пайплайн выполняет `pip install`. Это долго. GitLab CI позволяет сохранять директории между запусками с помощью директивы `cache`.
+Мы будем кэшировать директорию, куда `pip` скачивает пакеты. По умолчанию в Debian/Linux это `~/.cache/pip`. А ключом кэша сделаем хэш файла `requirements.txt` — если зависимости не менялись, берём старый кэш; если добавили новый пакет — кэш пересоздается.
+
+Добавим в `.gitlab-ci.yml` глобальную секцию `cache` (на одном уровне с `stages`):
+
+stages:
+  - lint
+  - test
+  - build
+  - security
+  - deploy_staging
+
+# Глобальный кэш для Python-зависимостей
+cache:
+  key:
+    files:
+      - api/requirements.txt
+  paths:
+    - .cache/pip
+
+variables:
+  # ... (старые переменные)
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip" # Говорим pip использовать нашу папку кэша
+
+Теперь в джобах `lint` и `test` `pip install` пролетит за секунды.
+
+Шаг 2. Кэшируем слои Docker (Build Kit и --cache-from)
+Docker-образы собираются слоями. Если мы меняем код Python, базовый образ `python:3.11-slim` и скачанные пакеты остаются прежними. Зачем их скачивать снова?
+Так как мы используем Docker Socket Binding (из практики 5), мы можем применить классический паттерн: перед сборкой скачать предыдущий собранный образ из Registry и использовать его как кэш (`--cache-from`).
+Обновим джобы `build_api` и `build_ui`:
+
+build_api:
+  stage: build
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    # Пытаемся стянуть предыдущий образ, чтобы использовать как кэш (|| true - чтобы не упасть, если образа ещё нет)
+    - docker pull $CI_REGISTRY_IMAGE/api:latest || true
+    - echo "Сборка API образа с кэшем"
+    - docker build 
+        --cache-from $CI_REGISTRY_IMAGE/api:latest 
+        -t $CI_REGISTRY_IMAGE/api:$DOCKER_TAG 
+        -t $CI_REGISTRY_IMAGE/api:latest 
+        ./api
+    - docker push $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
+    - docker push $CI_REGISTRY_IMAGE/api:latest
+
+build_ui:
+  stage: build
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/web:latest || true
+    - echo "Сборка Web образа с кэшем"
+    - docker build 
+        --cache-from $CI_REGISTRY_IMAGE/web:latest 
+        -t $CI_REGISTRY_IMAGE/web:$DOCKER_TAG 
+        -t $CI_REGISTRY_IMAGE/web:latest 
+        ./web-ui
+    - docker push $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
+    - docker push $CI_REGISTRY_IMAGE/web:latest
+
+При повторных коммитах вы увидите, что шаги `CACHED` в Docker будут пролетать мгновенно.*
+Шаг 3. Добавляем сканирование безопасности (Trivy)
+
+Мы не хотим деплоить образы с критическими уязвимостями. Сканер Trivy проверит наши образы на известные CVE (уязимости в базовых образах и библиотеках).
+
+Добавим новую стадию `security` после `build`. Мы настроим Trivy так, чтобы он падал (`exit code 1`), если найдены уязвимости с уровнем `CRITICAL` (Критические) или `HIGH` (Высокие).
+
+Добавим джобы сканирования:
+
+scan_api:
+  stage: security
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    # Скачиваем свежий образ, который только что собрали
+    - docker pull $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
+    # Запускаем Trivy. Если найдем CRITICAL или HIGH - пайплайн упадет.
+    - docker run --rm 
+        aquasec/trivy:latest image 
+        --exit-code 1 
+        --severity CRITICAL,HIGH 
+        $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
+  allow_failure: false # Строгое правило: не пускаем дальше при ошибках
+
+scan_ui:
+  stage: security
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
+    - docker run --rm 
+        aquasec/trivy:latest image 
+        --exit-code 1 
+        --severity CRITICAL,HIGH 
+        $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
+  allow_failure: false
+
+
+
+Шаг 3.5. Внедряем нативный SAST и Code Quality
+
+Мы уже научились проверять Docker-образы на уязвимости с помощью Trivy. Но что если мы используем абсолютно безопасный базовый образ, а в самом нашем коде есть дыра? Например, SQL-инъекция или захардкоженный пароль. Для этого нужен SAST.
+GitLab предоставляет встроенные шаблоны для безопасности, которые работают «из коробки» — вам не нужно устанавливать сканеры, GitLab сам скачает нужные анализаторы (для Python это bandit, для Go — gosec).
+Кроме того, мы уже используем `flake8` для линтинга. Но сейчас он просто падает или проходит, оставляя лог в консоли. GitLab умеет отображать замечания линтера прямо в Merge Request (вкладка Code Quality)! Для этого нужно научить `flake8` отдавать отчет в формате Code Climate JSON.
+
+Шаг A: Добавляем SAST
+Откройте `.gitlab-ci.yml` и добавьте в самый верх файла (перед `stages:`) подключение встроенного шаблона SAST:
+
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+
+Всё! Этого достаточно. При следующем запуске GitLab сам добавит джобы `semgrep-sast` (или `bandit-sast`), которые проверят ваш исходный код.
+
+Шаг B: Обновляем линтер (flake8) для Code Quality
+Чтобы `flake8` генерировал красивый отчет для GitLab, нам понадобится плагин `flake8-gl-codeclimate`.
+
+Обновим нашу джобу `lint`. Теперь она не просто будет ругаться в консоль, но и сохранит артефакт `codequality.json`, который GitLab подхватит:
+
+lint:
+  stage: lint
+  image: python:3.11-slim
+  tags:
+    - docker
+  cache:
+    key:
+      files:
+        - api/requirements.txt
+    paths:
+      - .cache/pip
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  before_script:
+    - pip install flake8 flake8-gl-codeclimate
+  script:
+    # Генерируем отчет в формате Code Climate
+    - flake8 api/app.py api/tests/ --format gl-codeclimate --output-file codequality.json
+  artifacts:
+    when: always # Важно: сохраняем артефакт даже если линтер нашел ошибки и джоба упала
+    reports:
+      codequality: codequality.json
+  allow_failure: true
+
+Теперь, если вы создадите Merge Request, GitLab покажет замечания от `flake8` прямо в диффе кода, как если бы это были комментарии ревьюера!
+
+Если прямо сейчас запустить пайплайн, добавленный нами SAST с вероятностью 99% упадет с ошибкой: `x509: certificate signed by unknown authority`.
+
+Почему так происходит? Шаблоны безопасности GitLab скачивают специальные Docker-образы-анализаторы из интернета. Когда этот контейнер запускается и пытается клонировать ваш репозиторий по HTTPS (`https://gitlab.local`), он видит наш самоподписанный сертификат и справедливо отказывается ему доверять. Внутри контейнера нет нашего локального сертификата!
+
+В корпоративных закрытых сетях (on-premise) эта проблема встречается повсеместно. GitLab предоставляет для неё элегантное решение: специальная переменная `ADDITIONAL_CA_CERT_BUNDLE`. Если создать такую переменную, GitLab автоматически пробросит этот сертификат во все джобы безопасности.
+
+Давайте настроим её:
+1. В терминале сервера выведите на экран содержимое вашего сертификата (мы генерировали его в Практике 1):
+
+   sudo cat /etc/gitlab/ssl/gitlab.local.crt
+   Скопируйте весь вывод, включая строки `-----BEGIN CERTIFICATE-----` и `-----END CERTIFICATE-----`.
+
+2. В веб-интерфейсе GitLab перейдите в ваш проект -> **Settings** -> **CI/CD** -> разверните раздел **Variables**.
+3. Нажмите кнопку **Add variable**.
+4. Заполните поля:
+   - **Key**: `ADDITIONAL_CA_CERT_BUNDLE`
+   - **Value**: Вставьте скопированный текст сертификата.
+   - **Type**: `Variable` (Переменная)
+   - **Environment scope**: `All` (Все)
+   - **Flags**: 
+     - Снимите галочку с **Mask variable** (Маскировать). Сертификат слишком длинный для маскирования, GitLab выдаст ошибку.
+     - Галочка **Expand variable reference** должна быть включена.
+5. Нажмите **Add variable**.
+
+Теперь SAST-анализаторы смогут доверять нашему серверу!
+
+
+Шаг 4. Собираем финальный .gitlab-ci.yml
+
+Вот как должен выглядеть ваш обновленный пайплайн целиком. Обратите внимание, что `deploy_staging` теперь находится в самом конце, после проверки безопасности!
+
+stages:
+  - lint
+  - test
+  - build
+  - security
+  - deploy_staging
+
+# Глобальный кэш
+cache:
+  key:
+    files:
+      - api/requirements.txt
+  paths:
+    - .cache/pip
+
+variables:
+  POSTGRES_DB: notesdb
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  DATABASE_URL: postgresql://postgres:postgres@postgres:5432/notesdb
+  DOCKER_TAG: $CI_COMMIT_SHORT_SHA
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+lint:
+  stage: lint
+  image: python:3.11-slim
+  tags:
+    - docker
+  script:
+    - pip install flake8
+    - flake8 api/app.py api/tests/
+  allow_failure: true
+
+test:
+  stage: test
+  image: python:3.11-slim
+  tags:
+    - docker
+  services:
+    - postgres:15-alpine
+  before_script:
+    - apt-get update && apt-get install -y wait-for-it
+    - pip install -r api/requirements.txt
+    - wait-for-it postgres:5432 --timeout=30
+  script:
+    - cd api && pytest tests/ -v
+
+build_api:
+  stage: build
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/api:latest || true
+    - docker build --cache-from $CI_REGISTRY_IMAGE/api:latest -t $CI_REGISTRY_IMAGE/api:$DOCKER_TAG -t $CI_REGISTRY_IMAGE/api:latest ./api
+    - docker push $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
+    - docker push $CI_REGISTRY_IMAGE/api:latest
+
+build_ui:
+  stage: build
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/web:latest || true
+    - docker build --cache-from $CI_REGISTRY_IMAGE/web:latest -t $CI_REGISTRY_IMAGE/web:$DOCKER_TAG -t $CI_REGISTRY_IMAGE/web:latest ./web-ui
+    - docker push $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
+    - docker push $CI_REGISTRY_IMAGE/web:latest
+
+scan_api:
+  stage: security
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
+    # Добавлен проброс docker.sock:
+    - docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 1 --severity CRITICAL,HIGH $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
+  allow_failure: false
+
+scan_ui:
+  stage: security
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
+    # Добавлен проброс docker.sock:
+    - docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 1 --severity CRITICAL,HIGH $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
+  allow_failure: false
+
+deploy_staging:
+  stage: deploy_staging
+  tags:
+    - cd
+  variables:
+    API_IMAGE: $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
+    WEB_IMAGE: $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - echo "Deploying version $DOCKER_TAG to Staging"
+    - docker compose -f docker-compose.staging.yml down || true
+    - docker compose -f docker-compose.staging.yml up -d
+  environment:
+    name: staging
+    url: http://gitlab.local:8088
+# Переопределяем джобы из шаблона SAST, чтобы они запускались на нашем Docker-раннере
+semgrep-sast:
+  tags:
+    - docker
+
+Шаг 5. Пушим и анализируем результат
+
+Отправьте изменения:
+
+git add .gitlab-ci.yml
+git commit -m "Add caching and Trivy security scanning"
+git push origin main
+
+
+Что вы увидите в GitLab CI/CD:
+1. Стадии `lint` и `test` пройдут быстрее (после второго запуска кэш отработает).
+2. Сборка Docker (`build`) пройдёт быстрее, так как использует `--cache-from`.
+3. Запустится новая стадия security. Trivy скачает свою базу уязвимостей (первый раз это займет около минуты) и просканирует образы.
+4. Мы не сможем пройти проверку, потому что есть нарушения безопасности
+
+Шаг 6. Лечим уязвимости в Docker-образах
+
+Когда Trivy ругается на наш образ, он чаще всего находит уязвимости не в нашем коде (который мы только что написали), а в "базовом образе" (например, в системных библиотеках внутри `python:3.11-slim` или `alpine`). Разработчики базовых образов выпускают патчи, но если мы скачали старую версию кэша, мы получаем старые дырки.
+
+Решение: Обновлять системные пакеты прямо во время сборки Docker-образа.
+
+1. Исправляем API (Python)
+
+Откройте `api/Dockerfile`. Сейчас он выглядит так:
+
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+Внесем два улучшения:
+1. Обновим системные пакеты Debian (на котором базируется `slim`-образ) с помощью `apt-get upgrade`.
+2. Обновим базовый образ до свежей минорной версии Python (`3.12-slim`), чтобы начать с более свежего состояния.
+
+Новый `api/Dockerfile`:**
+
+# Обновляем базовый образ до свежего Python 3.12
+FROM python:3.12-slim
+
+# Обновляем системные пакеты Debian, чтобы закрыть уязвимости в ncurses и др.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+*(Мы добавили `rm -rf /var/lib/apt/lists/*`, чтобы не раздувать размер образа кэшем apt).*
+
+2. Исправляем Web UI (Go)
+
+Откройте `web-ui/Dockerfile`. Сейчас второй этап выглядит так:
+
+# Этап 2: Запуск
+FROM alpine:latest
+WORKDIR /app
+COPY --from=builder /app/server .
+COPY web ./web
+EXPOSE 8080
+CMD ["./server"]
+
+
+Alpine — это минималистичный Linux. Уязвимости в нём лечатся одной командой `apk upgrade`.
+
+*Новый `web-ui/Dockerfile`:
+# Этап 1: Сборка - обновляем Go с 1.21 до 1.24 (в нём закрыты критические уязвимости)
+FROM golang:1.24-alpine AS builder
+WORKDIR /app
+COPY main.go .
+RUN CGO_ENABLED=0 GOOS=linux go build -o server main.go
+
+# Этап 2: Запуск
+FROM alpine:latest
+
+# Обновляем системные пакеты Alpine
+RUN apk update && apk upgrade --no-cache
+
+WORKDIR /app
+COPY --from=builder /app/server .
+COPY web ./web
+EXPOSE 8080
+CMD ["./server"]
+
+Шаг 7. Пушим исправления и радуемся зелёному пайплайну
+
+Теперь отправим наши "заплатки" в GitLab:
+git add api/Dockerfile web-ui/Dockerfile
+git commit -m "Fix: patch OS vulnerabilities in Docker images"
+git push origin main
+
+Что произойдёт в пайплайне:
+Вы столкнулись с тем, с чем сталкиваются инженеры каждый день: сканер нашёл уязвимости, для которых ещё нет исправлений, или которые требуют изменения политики безопасности.
+
+Давайте разберем оба падения:
+1. Web UI (Go): Trivy нашёл уязвимости в `stdlib` (стандартной библиотеке Go). Мы использовали `golang:1.24`, а исправления доступны в версии `1.25+` Это легко лечится обновлением базового образа.
+2. **API (Python):** Trivy нашёл уязвимость в системной библиотеке `ncurses` (Debian). Обратите внимание на колонку **Fixed Version** — она **пустая**. Это означает, что разработчики Debian ещё не выпустили патч для этой уязвимости! Команда `apt-get upgrade` бессильна: нет обновлённого пакета, который можно скачать.
+
+Как поступают в реальном DevOps?
+- Если уязвимость CRITICAL, часто откатываются на старую версию базового образа или меняют базовый образ (например, с Debian на Alpine).
+- Если уязвимость HIGH и для неё пока нет патча (как у нас с `ncurses`), её **разрешают**, но пайплайн настраивают так, чтобы он падал только от CRITICAL
+
+Давайте применим профессиональный подход: обновим Go и изменим политику безопасности Trivy, чтобы он блокировал деплой только при наличии критических (CRITICAL) дыр, а HIGH выдавал как предупреждение.
+Шаг 1. Обновляем Go в Web UI
+Откройте `web-ui/Dockerfile` и обновите версию Go (раз ваш сервер живет в 2026 году, используйте 1.26):
+
+
+# Этап 1: Сборка - обновляем Go до 1.26, где закрыты уязвимости
+FROM golang:1.26-alpine AS builder
+WORKDIR /app
+COPY main.go .
+RUN CGO_ENABLED=0 GOOS=linux go build -o server main.go
+
+# Этап 2: Запуск
+FROM alpine:latest
+
+# Обновляем системные пакеты Alpine
+RUN apk update && apk upgrade --no-cache
+
+WORKDIR /app
+COPY --from=builder /app/server .
+COPY web ./web
+EXPOSE 8080
+CMD ["./server"]
+`
+*(Если образ `golang:1.26-alpine` не скачается из-за несоответствия версий на Docker Hub, просто используйте `golang:alpine` — он всегда тянет последнюю стабильную версию).*
+
+Шаг 2. Меняем политику безопасности в .gitlab-ci.yml
+
+Мы изменим флаг `--severity` в джобах сканирования. Оставим `--exit-code 1` только для `CRITICAL`. Уязвимости уровня HIGH будут распечатываться в логе для информации, но не сломают пайплайн.
+
+Обновите джобы `scan_api` и `scan_ui`:
+
+
+scan_api:
+  stage: security
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
+    # Изменили --severity только на CRITICAL
+    - docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 1 --severity CRITICAL $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
+  allow_failure: false
+
+scan_ui:
+  stage: security
+  tags:
+    - docker
+  image: docker:latest
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
+    # Изменили --severity только на CRITICAL
+    - docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 1 --severity CRITICAL $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
+  allow_failure: false
+
+
+Шаг 3. Коммитим и проверяем
+
+Отправляем изменения:
+git add web-ui/Dockerfile .gitlab-ci.yml
+git commit -m "Fix: upgrade Go and adjust security policy to block only CRITICAL CVEs"
+git push origin main
+
+
+**Что произойдет сейчас:**
+1. Go-образ соберется на новой версии, и уязвимости в `stdlib` закроются.
+2. В джобе `scan_api` Trivy по-прежнему найдет 4 уязвимости HIGH в `ncurses`, но так как мы ищем только `CRITICAL`, сканер завершится с кодом 0 (успех) и пропустит деплой дальше.
+3. Пайплайн наконец-то станет полностью зелёным!
+
+Важный DevOps-урок для студентов
+Обратная сторона медали (Trade-off): Безопасность vs Скорость
+Добавив `apk upgrade` и `apt-get upgrade` в Dockerfile, мы решили проблему безопасности. Однако, мы сломали кэширование Docker, о котором мы заботились в Шаге 2!
+Почему? Команда `upgrade` каждый раз может скачивать разные версии патчей. Из-за этого слой Docker-образа меняется, и все последующие слои (включая `pip install`) вынуждены пересобираться с нуля. 
+В мире DevOps часто приходится искать баланс: 
+Для разработки иногда закрывают глаза на CVE ради скорости сборки.
+Для Production безопасность критична, поэтому перестройка образа с нуля при появлении новых патчей — это нормальная и необходимая практика.
+Существуют более продвинутые подходы: использовать инструменты вроде Renovate или Dependabot, которые автоматически создают Merge Request на обновление версии базового образа (например, с `python:3.12.1-slim` на `python:3.12.2-slim`), что позволяет обновлять безопасно, не ломая кэш каждой сборкой. Но на текущем этапе нашего курса, `upgrade` в Dockerfile — это простой и рабочий способ сделать наш микросервис защищённым!
+Такой подход не только дает студенту работающий пайплайн, но и заставляет задуматься о реальных архитектурных компромиссах в CI/CD.

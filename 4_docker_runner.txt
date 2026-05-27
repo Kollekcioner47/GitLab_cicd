@@ -1,0 +1,271 @@
+Теперь мы сделаем следующий шаг – контейнеризуем наше приложение и научимся использовать GitLab Container Registry. 
+Это позволит нам:
+- Собирать Docker-образы в пайплайне
+- Хранить их в приватном реестре GitLab
+- Запускать staging и production окружения как контейнеры
+- Использовать Docker-раннер для воспроизводимых сборок
+
+Что нам потребуется:
+- Docker, установленный на сервере с GitLab Runner
+- Дополнительный раннер с executor = docker (shell-раннер оставим для задач, где нужен sudo)
+- Включенный Container Registry в GitLab
+
+Шаг 1. Установка Docker и подготовка сервера
+установим  Docker
+sudo apt update
+sudo apt install ca-certificates curl -y
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+# Add the repository to Apt sources:
+sudo tee /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+sudo apt update
+sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker $USER
+sudo usermod -aG docker gitlab-runner
+# Перезагрузка (или выход/вход) для применения группы docker
+sudo init 6
+
+Шаг 2. Регистрируем новый Docker-раннер
+Зайдите в GitLab: Admin → CI/CD → Runners.
+Нажмите "New instance runner". Заполните:
+
+Теги: docker
+Описание: Docker executor runner
+Выберите "Run untagged" (по желанию)
+Нажмите "Create"
+Скопируйте токен регистрации (начинается с glrt-)
+
+Для регистрации выполните (замените <ваш_токен> на реальный):
+sudo gitlab-runner register \
+  --url https://gitlab.local \
+  --token <ваш_токен>
+
+При выборе executor напишите docker
+Образ docker по умолчанию: alpine:latest
+
+После регистрации перезапустите раннер:
+sudo systemctl restart gitlab-runner
+В интерфейсе GitLab вы должны увидеть новый раннер с тегом docker.
+
+Шаг 3. Включаем Container Registry в GitLab (с поддержкой HTTPS)
+Отредактируйте конфигурацию GitLab:
+sudo nano /etc/gitlab/gitlab.rb
+
+Найдите и измените (или добавьте) следующие строки:
+# Используем HTTPS для реестра (порт 5050)
+registry_external_url 'https://gitlab.local:5050'
+gitlab_rails['registry_enabled'] = true
+
+# Указываем те же SSL-сертификаты, что и для основного GitLab (они уже сгенерированы)
+registry_nginx['ssl_certificate'] = "/etc/gitlab/ssl/gitlab.local.crt"
+registry_nginx['ssl_certificate_key'] = "/etc/gitlab/ssl/gitlab.local.key"
+
+Переконфигурируйте GitLab:
+sudo gitlab-ctl reconfigure
+
+Проверьте, что реестр работает (из-за самоподписанного сертификата используем -k):
+curl -k https://gitlab.local:5050
+# Должен вернуть пустой ответ или "404 page not found" – это нормально
+
+Шаг 4. Настройка Docker для работы с самоподписанным сертификатом реестра
+Разрешите Docker на хосте использовать HTTPS-реестр с самоподписанным сертификатом:
+sudo nano /etc/docker/daemon.json
+
+{
+  "insecure-registries": ["gitlab.local:5050"]
+}
+
+Перезапустите Docker:
+sudo systemctl restart docker
+
+Шаг 5. Создаём Dockerfile для нашего сайта
+Перейдите в локальную папку проекта simple-site (той же, что во второй практике).
+Создайте файл Dockerfile:
+FROM nginx:alpine
+# Копируем собранные файлы сайта
+COPY build/ /usr/share/nginx/html
+# Expose порт 80
+EXPOSE 80
+# Запускаем nginx
+CMD ["nginx", "-g", "daemon off;"]
+
+Также создайте .dockerignore, чтобы не отправлять лишние файлы в контекст сборки:
+.git
+.gitlab-ci.yml
+Dockerfile
+.idea
+*.md
+
+Шаг 6. Обновляем .gitlab-ci.yml – добавляем сборку образа, реестр и контейнерный деплой
+Теперь наш пайплайн будет:
+Линтинг (оставим)
+Сборка статики (build)
+Сборка Docker-образа и публикация в Container Registry (docker_build)
+Деплой staging через Docker (замена rsync на запуск контейнера)
+Тестирование staging (curl на контейнере)
+Деплой production (manual) тоже через контейнер.
+
+.gitlab-ci.yml:
+stages:
+  - lint
+  - build
+  - docker_build
+  - deploy_staging
+  - test_staging
+  - deploy_production
+
+variables:
+  DOCKER_IMAGE: $CI_REGISTRY_IMAGE
+  DOCKER_TAG: $CI_COMMIT_SHORT_SHA
+  STAGING_CONTAINER_NAME: simple-site-staging
+  PRODUCTION_CONTAINER_NAME: simple-site-production
+  STAGING_PORT: 8085
+  PRODUCTION_PORT: 85
+
+lint_html:
+  stage: lint
+  tags:
+    - cd
+  script:
+    - echo "Проверка HTML"
+    - tidy -errors index.html
+
+build_site:
+  stage: build
+  tags:
+    - cd
+  script:
+    - echo "Сборка статики"
+    - mkdir -p build
+    - cp -r index.html css js build/
+  artifacts:
+    paths:
+      - build/
+    expire_in: 1 hour
+
+docker_build:
+  stage: docker_build
+  tags:
+    - docker
+  image: docker:latest
+  services:
+    - name: docker:dind
+      command: ["--insecure-registry=gitlab.local:5050"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    # Логинимся в реестр (протокол будет HTTPS, так как Docker использует его по умолчанию)
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - echo "Сборка Docker-образа с тегом $DOCKER_TAG"
+    - docker build -t $DOCKER_IMAGE:$DOCKER_TAG .
+    - docker tag $DOCKER_IMAGE:$DOCKER_TAG $DOCKER_IMAGE:latest
+    - docker push $DOCKER_IMAGE:$DOCKER_TAG
+    - docker push $DOCKER_IMAGE:latest
+  dependencies:
+    - build_site
+
+deploy_staging:
+  stage: deploy_staging
+  tags:
+    - cd
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker stop $STAGING_CONTAINER_NAME || true
+    - docker rm $STAGING_CONTAINER_NAME || true
+    - docker run -d --name $STAGING_CONTAINER_NAME -p $STAGING_PORT:80 $DOCKER_IMAGE:$DOCKER_TAG
+  environment:
+    name: staging
+    url: http://gitlab.local:$STAGING_PORT   # сам сайт работает по HTTP на указанном порту
+
+test_staging:
+  stage: test_staging
+  tags:
+    - cd
+  script:
+    - sleep 5
+    - curl --fail http://localhost:$STAGING_PORT
+  environment:
+    name: staging
+
+deploy_production:
+  stage: deploy_production
+  tags:
+    - cd
+  when: manual
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker stop $PRODUCTION_CONTAINER_NAME || true
+    - docker rm $PRODUCTION_CONTAINER_NAME || true
+    - docker run -d --name $PRODUCTION_CONTAINER_NAME -p $PRODUCTION_PORT:80 $DOCKER_IMAGE:latest
+  environment:
+    name: production
+    url: http://gitlab.local:$PRODUCTION_PORT   # сайт на HTTP
+
+ВАЖНО: Переменные CI_REGISTRY_USER, CI_REGISTRY_PASSWORD, CI_REGISTRY_IMAGE автоматически доступны в пайплайне GitLab, поэтому before_script сможет выполнить логин. Переменная CI_REGISTRY содержит адрес реестра без протокола (gitlab.local:5050), Docker по умолчанию использует HTTPS.
+
+Шаг 7. Настройка Docker-раннера для доступа к хосту по имени gitlab.local
+Скорее всего вы получите ошибку, потому что контейнер раннера не видит наш локальный адрес gitlab.local.
+Добавьте extra_hosts в конфигурацию раннера, а также установите privileged = true.
+Отредактируйте /etc/gitlab-runner/config.toml. Найдите секцию вашего Docker-раннера и внутри [runners.docker] добавьте строки:
+
+[[runners]]
+  name = "docker-runner"
+  url = "https://gitlab.local"
+  token = "glrt-..."
+  executor = "docker"
+  [runners.docker]
+    image = "alpine:latest"
+    extra_hosts = ["gitlab.local:10.0.2.5"]   # замените на реальный IP вашего хоста (можно узнать командой ip a)
+    privileged = true
+
+После редактирования перезапустите раннер:
+sudo systemctl restart gitlab-runner
+
+Шаг 8. Коммитим изменения и пушим
+git add Dockerfile .dockerignore .gitlab-ci.yml
+git commit -m "Add Docker and Container Registry"
+git push origin main
+
+Шаг 9. Смотрим пайплайн в GitLab
+Перейдите в ваш проект → CI/CD → Pipelines. Вы увидите новые стадии:
+docker_build – сборка образа (может занять 1-2 минуты при первом запуске)
+deploy_staging – развернёт staging контейнер на порту 8085
+test_staging – проверит доступность сайта
+deploy_production – запустится вручную (кнопка Play)
+После успешного выполнения staging откройте в браузере: http://gitlab.local:8085
+Production после подтверждения: http://gitlab.local:85
+
+Шаг 10. Исследуем Container Registry
+Зайдите в проект → Deploy → Container Registry. Вы увидите сохранённые образы с тегами (commit hash и latest). Обратите внимание, что доступ к реестру осуществляется по HTTPS: https://gitlab.local:5050
+
+Что нового вы освоили:
+- Docker-раннер, изолированное выполнение заданий
+- Сборку Docker-образов внутри CI/CD
+- Публикацию в приватный GitLab Container Registry через HTTPS
+- Использование артефактов между стадиями (build → docker_build)
+- Деплой через запуск контейнеров на том же хосте
+- Переменные окружения, предоставляемые GitLab ($CI_REGISTRY_*)
+- Настройку самоподписанных сертификатов для реестра
+
+Следующие шаги (по желанию):
+- Добавить проверку безопасности образа (Docker Scan, Trivy)
+- Настроить динамические окружения (Review Apps) для каждой ветки
+- Использовать docker-compose для многоконтейнерных приложений
+- Организовать откат (rollback) через перезапуск контейнера с предыдущим тегом
+
+Поздравляю! Вы построили полноценный конвейер CI/CD с контейнеризацией и HTTPS.

@@ -1,0 +1,205 @@
+Теперь проект будет:
+
+содержать несколько файлов
+иметь staging и production
+собирать артефакты
+выполнять проверку HTML
+проверять доступность сайта после deploy
+использовать manual approval
+
+Итоговая структура
+simple-site/
+├── index.html
+├── css/
+│   └── style.css
+├── js/
+│   └── app.js
+└── .gitlab-ci.yml
+
+Шаг 1. Создаём отдельные сайты Apache
+Создаём каталоги
+sudo mkdir -p /var/www/staging
+sudo mkdir -p /var/www/production
+
+sudo chown -R www-data:www-data /var/www/staging
+sudo chown -R www-data:www-data /var/www/production
+
+Шаг 2. Создаём тестовый сайт
+index.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CI/CD Demo</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<h1>GitLab CI/CD Demo</h1>
+
+<button onclick="hello()">Click me</button>
+
+<script src="js/app.js"></script>
+
+</body>
+</html>
+
+css/style.css
+body {
+    font-family: Arial;
+    background: #f0f0f0;
+    padding: 40px;
+}
+
+h1 {
+    color: darkblue;
+}
+
+js/app.js
+function hello() {
+    alert("Pipeline works");
+}
+
+
+Шаг 3. Устанавливаем HTML validator
+sudo apt install tidy rsync -y
+
+Шаг 4. Новый pipeline
+Теперь .gitlab-ci.yml будет уже существенно интереснее.
+
+stages:
+  - lint
+  - build
+  - deploy_staging
+  - test_staging
+  - deploy_production
+
+variables:
+  STAGING_DIR: /var/www/staging
+  PRODUCTION_DIR: /var/www/production
+
+lint_html:
+  stage: lint
+  script:
+    - echo "Проверка HTML"
+    - tidy -errors index.html
+
+build_site:
+  stage: build
+  script:
+    - echo "Сборка сайта"
+    - mkdir build
+    - cp -r index.html css js build/
+  artifacts:
+    paths:
+      - build/
+
+deploy_staging:
+  stage: deploy_staging
+  script:
+    - echo "Deploy to staging"
+    - sudo rsync -av --delete build/ $STAGING_DIR/
+  environment:
+    name: staging
+
+test_staging:
+  stage: test_staging
+  script:
+    - echo "Проверка staging"
+    - curl --fail http://localhost:8081
+  environment:
+    name: staging
+
+deploy_production:
+  stage: deploy_production
+  script:
+    - echo "Deploy to production"
+    - sudo rsync -av --delete build/ $PRODUCTION_DIR/
+  when: manual
+  environment:
+    name: production
+
+Что здесь нового
+stages
+lint → build → staging → test → production
+Теперь pipeline состоит из этапов:
+
+artifacts
+artifacts:
+  paths:
+    - build/
+
+GitLab сохраняет результат сборки и передаёт дальше.
+
+Это уже настоящий CI/CD-подход.
+rsync
+rsync -av --delete
+
+Умеет:
+
+удалять старые файлы
+копировать только изменения
+синхронизировать каталоги
+environments
+environment:
+  name: staging
+
+GitLab начинает показывать environments.
+
+manual deploy
+when: manual
+
+Production deploy запускается кнопкой.
+
+Это очень похоже на реальные процессы.
+
+Шаг 5. Настраиваем Apache
+
+Теперь сделаем 2 сайта:
+
+
+Создаём конфиг
+sudo nano /etc/apache2/sites-available/staging.conf
+<VirtualHost *:8081>
+    DocumentRoot /var/www/staging
+
+    <Directory /var/www/staging>
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+
+sudo nano /etc/apache2/sites-available/production.conf
+<VirtualHost *:81>
+    DocumentRoot /var/www/production
+
+    <Directory /var/www/production>
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+
+Шаг 6. Включаем порт 8081
+sudo nano /etc/apache2/ports.conf
+
+Добавляем:
+Listen 8081
+
+Шаг 7. Активируем сайты
+sudo a2ensite staging.conf
+sudo a2ensite production.conf
+sudo systemctl reload apache2
+
+Шаг 8. Проверяем
+staging
+http://localhost:8081
+production
+http://localhost:81
+Шаг 9. Push
+git add .
+git commit -m "advanced pipeline"
+git push
+
+заходии в наш проект на портале, там открываем build -> pipelines
+там смотрим пока наш конвейер не дойдёт до стадии test_staged:passed
+далее от нас ожидают ручного подтверждения, сначала проверяем http://localhost:8081
+если всё устраивает, то подтверждаем и смотрим боевой сайт на http://localhost:81
