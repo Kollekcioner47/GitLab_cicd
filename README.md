@@ -22,7 +22,7 @@ DevOps/GitLab CI/CD: Полный курс от установки до Producti
 
 Как использовать
 Склонируйте репозиторий на свою ВМ:
-git clone https://github.com/your-username/devops-course.git
+git clone https://github.com/Kollekcioner47/GitLab_cicd.git
 cd devops-course
 Открывайте файлы по порядку (от 1_install.txt до 8_...) и выполняйте инструкции.
 Каждый файл – это законченная практика. Вы можете останавливаться после любой из них, но для полного понимания рекомендуется пройти последовательно.
