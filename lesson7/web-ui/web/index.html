@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Notes App</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; }
+        .note { border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; border-radius: 5px; }
+        form { margin-bottom: 20px; }
+        input, textarea { width: 100%; margin-bottom: 5px; padding: 8px; }
+    </style>
+</head>
+<body>
+    <h1>Мои Заметки</h1>
+    <form id="noteForm">
+        <input type="text" id="title" placeholder="Заголовок" required>
+        <textarea id="content" placeholder="Текст заметки"></textarea>
+        <button type="submit">Добавить</button>
+    </form>
+    <div id="notesList"></div>
+
+    <script>
+        const API_URL = '/api/notes/';
+
+        async function fetchNotes() {
+            const res = await fetch(API_URL);
+            const notes = await res.json();
+            document.getElementById('notesList').innerHTML = notes.map(n => 
+                `<div class="note"><b>${n.title}</b><p>${n.content || ''}</p></div>`
+            ).join('');
+        }
+
+        document.getElementById('noteForm').onsubmit = async (e) => {
+            e.preventDefault();
+            await fetch(API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    title: document.getElementById('title').value,
+                    content: document.getElementById('content').value
+                })
+            });
+            document.getElementById('title').value = '';
+            document.getElementById('content').value = '';
+            fetchNotes();
+        };
+
+        fetchNotes();
+    </script>
+</body>
+</html>
