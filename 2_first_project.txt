@@ -6,6 +6,12 @@ sudo nano /etc/apache2/ports.conf
 Listen 81
 sudo systemctl restart apache2
 
+# Заодно поправим порт у сайта по умолчанию: он объявлен как <VirtualHost *:80>,
+# а слушающего порта 80 больше нет — Apache будет на это ругаться.
+sudo nano /etc/apache2/sites-available/000-default.conf
+# <VirtualHost *:80>  ->  <VirtualHost *:81>
+sudo systemctl reload apache2
+
 подготовим папку проекта:
 mkdir simple-site
 cd simple-site
@@ -57,7 +63,7 @@ stages:
 test_html:
   stage: test
   tags:
-    - test
+    - cd
   script:
     - echo "Проверяем наличие index.html"
     - test -f index.html
@@ -65,7 +71,7 @@ test_html:
 deploy_to_apache:
   stage: deploy
   tags:
-    - test
+    - cd
   script:
     - echo "Deploy в Apache"
     - sudo cp index.html /var/www/html/index.html
@@ -73,7 +79,17 @@ deploy_to_apache:
     - main
 
 
-git add *
+# Обратите внимание: тег джобы (cd) — это тег раннера, который мы зарегистрировали
+# в первой практике. Если тег не совпадает, джоба останется в очереди навсегда.
+
+git add .
 git commit -m "First deploy"
+
+# Не забываем отправить изменения в GitLab — без push конвейер не запустится.
+# Именно из отправленного коммита GitLab читает .gitlab-ci.yml.
+git push origin main
+
+# Почему не git add *: звёздочка не раскрывается на файлы, начинающиеся с точки,
+# поэтому .gitlab-ci.yml остался бы незакоммиченным. Используйте git add .
 
 проверяем в браузере localhost:81

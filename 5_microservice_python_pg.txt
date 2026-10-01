@@ -24,7 +24,7 @@ source venv/bin/activate
 fastapi
 uvicorn
 sqlalchemy
-psycopg2-binary
+psycopg[binary]
 pytest
 httpx
 Установите:
@@ -195,9 +195,11 @@ docker compose up app
 # или сразу оба: docker compose up
 
 Шаг 7. GitLab CI/CD (минимальный работающий пайплайн)
-Прежде чем писать пайплайн, нам нужно решить одну важную архитектурную задачу. По умолчанию для сборки Docker-образов используют технологию Docker-in-Docker (DinD). Однако в локальных установках с самоподписанными сертификатами DinD приводит к ошибкам x509 (недоверие сертификату) при попытке запушить образ в Registry.
+Прежде чем писать пайплайн, нам нужно решить одну важную архитектурную задачу. Классический способ собирать Docker-образы — технология Docker-in-Docker (DinD): сервисом поднимается отдельный демон Docker внутри джобы. Ему нужен privileged-режим, и сертификат самоподписанного реестра придётся передавать ему отдельно: демон внутри джобы не знает о сертификате, который вы добавили на хост, и push в gitlab.local:5050 действительно упадёт с ошибкой x509. Именно поэтому в практике 4 для сервиса docker:dind мы прописывали --insecure-registry=gitlab.local:5050 — так проверка сертификата отключается.
 
 Поскольку GitLab и Runner работают на одной ВМ, мы используем более простой и надёжный подход — **Docker Socket Binding**. Мы разрешим раннеру использовать Docker-демон самой виртуалки. Это быстрее и полностью избавляет от проблем с сертификатами.
+
+Важно: при socket binding сервис `docker:dind` использовать нельзя. Как прямо сказано в документации GitLab, монтирование применяется и к сервисным контейнерам, поэтому они становятся несовместимыми (цитата: «...you cannot use the docker:dind service, because the mounting is also applied to the service containers, making them incompatible»). Поэтому в проекте `simple-site` из практики 4 джобу `docker_build` нужно переписать без сервиса `docker:dind` и без переменных `DOCKER_HOST` / `DOCKER_DRIVER` / `DOCKER_TLS_CERTDIR`: готовый вариант приведён в конце практики 4 (блок «ВАЖНО на будущее»).
 
 Для этого выполните два подготовительных шага на вашей ВМ:
 
@@ -207,16 +209,18 @@ sudo mkdir -p /etc/docker/certs.d/gitlab.local:5050
 sudo cp /etc/gitlab/ssl/gitlab.local.crt /etc/docker/certs.d/gitlab.local:5050/ca.crt
 sudo systemctl restart docker
 
+Пояснение: TLS-соединение с реестром устанавливает демон Docker, а не CLI-клиент. Поэтому сертификат нужен именно на хосте, в каталоге /etc/docker/certs.d/gitlab.local:5050/ca.crt. Системное хранилище CA (/usr/local/share/ca-certificates + update-ca-certificates) Docker для работы с реестрами не использует — добавление сертификата только туда проблему не решит.
 
 2. Настройте GitLab Runner на использование сокета хоста. Откройте конфигурацию раннера:
 
 sudo nano /etc/gitlab-runner/config.toml
-Найдите секцию [runners.docker] и добавьте монтирование сокета и папки с сертификатами в строку volumes:
+Найдите секцию [runners.docker]. Обязательное здесь — только монтирование сокета: без /var/run/docker.sock:/var/run/docker.sock джоба не увидит демон хоста. Каталог /etc/docker/certs.d монтировать в контейнер джобы не нужно: TLS к реестру выполняет демон хоста, и сертификат уже лежит на хосте. Оставляем его в списке как безвредный (лишнее монтирование ничего не ломает, но и пользы не приносит) — так строка volumes остаётся универсальной:
 toml
 [[runners]]
   ...
   [runners.docker]
     ...
+    # /var/run/docker.sock обязателен; /etc/docker/certs.d не обязателен, но безвреден
     volumes = ["/cache", "/var/run/docker.sock:/var/run/docker.sock", "/etc/docker/certs.d:/etc/docker/certs.d:ro"]
 Сохраните файл и перезапустите раннер: sudo gitlab-runner restart.
 
@@ -265,7 +269,7 @@ build:
   before_script:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
   script:
-    - docker build -t $CI_REGISTRY_IMAGE:latest .
+    - docker build --provenancy=false -t $CI_REGISTRY_IMAGE:latest .
     - docker push $CI_REGISTRY_IMAGE:latest
   only:
     - main
@@ -286,6 +290,8 @@ pytest tests/ -v
 Исправьте ошибки, если есть.
 
 Шаг 9. Отправка в GitLab
+Сначала создайте проект в веб-интерфейсе GitLab: «Новый проект» → «Create blank project», имя notes-api, namespace root. Галочку «Initialize repository with a README» снимите — иначе в репозитории появится первый коммит с README, и ваш push не пройдёт без слияния историй. Если проект в GitLab не создан, push завершится ошибкой «Project Not Found».
+Ещё одна ремарка про имя ветки: если git init создал ветку master, переименуйте её командой git branch -M main (в курсе везде используется ветка main). Дальше отправляем код:
 bash
 git init
 git remote add origin git@gitlab.local:root/notes-api.git

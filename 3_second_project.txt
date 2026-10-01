@@ -79,12 +79,16 @@ variables:
 
 lint_html:
   stage: lint
+  tags:
+    - cd
   script:
     - echo "Проверка HTML"
     - tidy -errors index.html
 
 build_site:
   stage: build
+  tags:
+    - cd
   script:
     - echo "Сборка сайта"
     - mkdir build
@@ -95,6 +99,8 @@ build_site:
 
 deploy_staging:
   stage: deploy_staging
+  tags:
+    - cd
   script:
     - echo "Deploy to staging"
     - sudo rsync -av --delete build/ $STAGING_DIR/
@@ -103,6 +109,8 @@ deploy_staging:
 
 test_staging:
   stage: test_staging
+  tags:
+    - cd
   script:
     - echo "Проверка staging"
     - curl --fail http://localhost:8081
@@ -111,6 +119,8 @@ test_staging:
 
 deploy_production:
   stage: deploy_production
+  tags:
+    - cd
   script:
     - echo "Deploy to production"
     - sudo rsync -av --delete build/ $PRODUCTION_DIR/
@@ -118,9 +128,12 @@ deploy_production:
   environment:
     name: production
 
+# Тег cd у всех джоб — это тег нашего shell-раннера из первой практики.
+# Без совпадающего тега джобы просто не будут запускаться.
+
 Что здесь нового
 stages
-lint → build → staging → test → production
+lint → build → deploy_staging → test_staging → deploy_production
 Теперь pipeline состоит из этапов:
 
 artifacts
@@ -189,6 +202,10 @@ sudo a2ensite staging.conf
 sudo a2ensite production.conf
 sudo systemctl reload apache2
 
+# Если Apache жалуется на *:80 (порт больше никто не слушает) — отключите сайт по умолчанию:
+sudo a2dissite 000-default
+sudo systemctl reload apache2
+
 Шаг 8. Проверяем
 staging
 http://localhost:8081
@@ -200,6 +217,6 @@ git commit -m "advanced pipeline"
 git push
 
 заходии в наш проект на портале, там открываем build -> pipelines
-там смотрим пока наш конвейер не дойдёт до стадии test_staged:passed
+там смотрим, как наш конвейер проходит стадии и доходит до test_staging: passed
 далее от нас ожидают ручного подтверждения, сначала проверяем http://localhost:8081
 если всё устраивает, то подтверждаем и смотрим боевой сайт на http://localhost:81

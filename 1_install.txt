@@ -5,6 +5,13 @@ sudo apt install git -y
 нам нужно установить curl:
 sudo apt install -y curl
 
+# Чтобы GitLab был доступен по имени gitlab.local на этой же машине (в браузере, в curl,
+# в gitlab-runner), добавьте это имя в /etc/hosts. Сертификат мы будем выпускать именно на него.
+echo "127.0.0.1 gitlab.local" | sudo tee -a /etc/hosts
+
+# Если у вас проблемы с IPv6 (GitLab иногда "зависает" на нём), заставьте curl использовать IPv4:
+echo "ipv4" | sudo tee /etc/curlrc
+
 # ------------------------------------------------------------
 # 1. Генерация самоподписанного сертификата с поддержкой SAN (для совместимости с Go/gitlab-runner)
 # ------------------------------------------------------------
@@ -44,27 +51,28 @@ sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
 sudo chmod 600 /etc/gitlab/ssl/gitlab.local.*
 sudo chmod 755 /etc/gitlab/ssl
 
-# 2. Скопируем сертификат 
-sudo cp /etc/gitlab/ssl/gitlab.local.crt /usr/local/share/ca-certificates/gitlab-local.crt
-sudo chmod 644 /usr/local/share/ca-certificates/gitlab-local.crt
-
- обновим хранилище
-sudo update-ca-certificates --verbose --fresh
-
-Проверим, добавился ли сертификат в ca-certificates.crt
-sudo grep -A 5 "gitlab.local" /etc/ssl/certs/ca-certificates.crt
+# В доверенные на хосте сертификат добавим в разделе 4 (там же проверим, что ему доверяют curl и git).
 
 # ------------------------------------------------------------
-# 2. Установка GitLab с поддержкой HTTPS
+# 2. Установка GitLab и GitLab Runner с поддержкой HTTPS
 # ------------------------------------------------------------
-# Скачиваем скрипт установки (здесь официальный репозиторий имеет валидный сертификат, 
-# но для самоподписанного на стороне клиента он не нужен, оставляем как есть)
-echo "ipv4" | sudo tee /etc/curlrc
-
+# Скачиваем скрипт установки (здесь официальный репозиторий имеет валидный сертификат,
+# поэтому ничего дополнительно настраивать не нужно)
 curl --location "https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh" | sudo bash
 
 # Устанавливаем GitLab, указав HTTPS URL
 sudo EXTERNAL_URL="https://gitlab.local" apt install gitlab-ce -y
+
+Установим GitLab Runner - утилиту для запуска действий конвейера 
+скачиваем скрипт установки:
+curl -L "https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh" -o script.deb.sh
+
+запускаем:
+sudo bash script.deb.sh
+
+Производим установку:
+sudo apt install gitlab-runner -y
+
 
 # ------------------------------------------------------------
 # 3. Настройка GitLab для использования самоподписанного сертификата
@@ -91,7 +99,10 @@ sudo cp /etc/gitlab/ssl/gitlab.local.crt /usr/local/share/ca-certificates/gitlab
 sudo chmod 644 /usr/local/share/ca-certificates/gitlab-local.crt
 
 # Обновляем хранилище доверенных сертификатов
-sudo update-ca-certificates --fresh
+sudo update-ca-certificates --verbose --fresh
+
+# Проверяем, что сертификат добавился в ca-certificates.crt
+sudo grep -A 5 "gitlab.local" /etc/ssl/certs/ca-certificates.crt
 
 # Проверяем, что теперь curl и git доверяют нашему GitLab без ключа -k
 curl https://gitlab.local --verbose 2>&1 | grep "SSL certificate verify ok"
@@ -105,7 +116,7 @@ echo "Пароль root:"
 sudo cat /etc/gitlab/initial_root_password | grep Password
 
 # ------------------------------------------------------------
-# 8. Регистрация раннера (теперь без --insecure, т.к. сертификат доверенный)
+# 6. Регистрация раннера 
 # ------------------------------------------------------------
 # Перейдите в браузере по адресу https://gitlab.local (браузер может показать предупреждение — 
 # это нормально для самоподписанного сертификата, добавьте исключение)
@@ -113,11 +124,16 @@ sudo cat /etc/gitlab/initial_root_password | grep Password
 # В правом верхнем углу портала нажмите "Admin"
 # В админке перейдите в раздел CI/CD -> Runners
 # Нажмите ссылку "Still using registration tokens?" — скопируйте токен.
+# Если такой ссылки в вашей версии GitLab нет (старый способ регистрации помечен как устаревший),
+# нажмите "New instance runner", создайте раннер и скопируйте токен, начинающийся с glrt-.
 
 # Зарегистрируйте runner (теперь сертификат доверенный, флаг --insecure не нужен)
 sudo gitlab-runner register \
   --url https://gitlab.local/ \
   --registration-token <ваш_токен>
+
+# Либо, если вы используете токен нового образца (glrt-):
+# sudo gitlab-runner register --url https://gitlab.local/ --token glrt-xxxxxxxxxxxx
 
 # Во время диалога:
 # Enter the GitLab instance URL: https://gitlab.local/
@@ -127,8 +143,11 @@ sudo gitlab-runner register \
 # Enter optional maintenance note: (просто нажмите Enter)
 # Enter executor: shell
 
+# ВАЖНО: тег раннера должен совпадать с тегами в .gitlab-ci.yml.
+# В следующих практиках джобы используют тег cd — именно его мы и задали выше.
+
 # ------------------------------------------------------------
-# 9. Настройка SSH-аутентификации
+# 7. Настройка SSH-аутентификации
 # ------------------------------------------------------------
 # Создайте ключ SSH (если ещё нет)
 ssh-keygen 
