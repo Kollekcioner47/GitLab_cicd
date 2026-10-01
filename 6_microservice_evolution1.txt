@@ -17,10 +17,15 @@ notes-api/
 │   ├── web/
 │   │   └── index.html
 │   └── Dockerfile
+├── pytest.ini          # <--- ВАЖНО: лежит в КОРНЕ проекта, а не в api/ (см. примечание ниже)
 ├── docker-compose.yml
 └── .gitlab-ci.yml
 
-Примечание: Не забудьте обновить путь к приложению в `api/tests/test_api.py`: `from api.app import app` (вместо `from app import app`), а в `api/Dockerfile` изменить `COPY . .` на `COPY api/ .` или настроить контекст сборки (мы сделаем это через CI).
+Примечание: Не забудьте обновить путь к приложению в `api/tests/test_api.py`: `from api.app import app` (вместо `from app import app`).
+
+Про `api/Dockerfile`: менять `COPY . .` там НЕ нужно. Контекст сборки — это каталог `api/` (в CI мы собираем через `docker build ... ./api`, а в `docker-compose.yml` указано `build: ./api`), поэтому `COPY . .` копирует в образ именно содержимое `api/`. Вариант `COPY api/ .` при таком контексте ничего не найдёт: внутри контекста папки `api` нет.
+
+Про `pytest.ini`: этот файл лежит в корне проекта, а не в `api/`. CI выполняет `cd api && pytest tests/ -v`, pytest ищет конфиг вверх по дереву каталогов и находит корневой `pytest.ini`, а его `pythonpath = .` указывает на корень проекта — именно поэтому в `api/tests/test_api.py` работает импорт `from api.app import app`. Если перенести `pytest.ini` в `api/`, то `pythonpath = .` станет указывать на `api/`, и импорт `from api.app import app` упадёт с `ModuleNotFoundError: No module named 'api'` — в этом случае нужно вернуть `from app import app`.
 
 Шаг 2. Пишем веб-интерфейс на Go
 
@@ -61,7 +66,7 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-*(Внимание: добавьте `import "os"` в блок импорта, так как мы используем `os.LookupEnv`)*
+*(Импорт `os` уже подключён в блоке импорта в листинге выше.)*
 
 Создайте простейший интерфейс `web-ui/web/index.html`:
 
@@ -131,7 +136,7 @@ WORKDIR /app
 COPY main.go .
 RUN CGO_ENABLED=0 GOOS=linux go build -o server main.go
 
-# Этап 2: Запуск (используем пустой образ scratch)
+# Этап 2: Запуск (минимальный образ alpine — бинарник статический)
 FROM alpine:latest
 WORKDIR /app
 COPY --from=builder /app/server .
@@ -226,7 +231,7 @@ build_api:
   before_script:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
   script:
-    - docker build -t $CI_REGISTRY_IMAGE/api:$DOCKER_TAG -t $CI_REGISTRY_IMAGE/api:latest ./api
+    - docker build --provenancy=false -t $CI_REGISTRY_IMAGE/api:$DOCKER_TAG -t $CI_REGISTRY_IMAGE/api:latest ./api
     - docker push $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
     - docker push $CI_REGISTRY_IMAGE/api:latest
 
@@ -246,6 +251,8 @@ deploy_staging:
   stage: deploy_staging
   tags:
     - cd
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
   variables:
     API_IMAGE: $CI_REGISTRY_IMAGE/api:$DOCKER_TAG
     WEB_IMAGE: $CI_REGISTRY_IMAGE/web:$DOCKER_TAG
@@ -258,6 +265,9 @@ deploy_staging:
   environment:
     name: staging
     url: http://gitlab.local:8088 
+
+
+Staging разворачивается только из ветки `main`: благодаря `rules` джоба `deploy_staging` не запускается для мерж-реквестов и фича-веток, поэтому они не перезаписывают уже развернутое окружение.
 
 
 Шаг 6. Создаем docker-compose.staging.yml
@@ -297,12 +307,19 @@ volumes:
 
 Шаг 7. Коммитим и пушим
 
-Перед пушем не забудьте создать/обновить `.dockerignore` в корне проекта:
+Перед пушем не забудьте создать `.dockerignore` в каталогах `api/` и `web-ui/`. Docker ищет этот файл в корне контекста сборки, а контексты у нас — `./api` и `./web-ui` (см. Шаг 5 и Шаг 4), поэтому корневой `.dockerignore` не действует. Корневой `.dockerignore` из практики 5 теперь не используется, его можно удалить.
+
+`api/.dockerignore`:
 venv
 __pycache__
 .git
-.gitlab-ci.yml
 *.pyc
+tests/report-*.xml
+
+`web-ui/.dockerignore`:
+.git
+*.md
+Dockerfile
 
 
 Отправляем изменения:
@@ -316,7 +333,7 @@ git push origin main
 
 1. Зайдите в GitLab → CI/CD → Pipelines. Вы увидите 4 стадии.
 2. После успешного прохождения `build_api` и `build_ui`, перейдите в **Deploy → Container Registry**. Вы увидите две папки (`api` и `web`), в каждой из которых будут образы с тегом в виде короткого хеша коммита (например, `a1b2c3d4`) и тегом `latest`.
-3. Когда джоба `deploy_staging` отработает, откройте в браузере: http://gitlab.local:8088
+3. Когда джоба `deploy_staging` отработает, откройте в браузере: **http://gitlab.local:8088** (порт 8080 — это локальный `docker-compose.yml` из Шага 4, а staging публикует веб-интерфейс на 8088, см. `docker-compose.staging.yml`).
 4. Вы увидите ваш интерфейс! Попробуйте создать заметку — она сохранится в базе данных через API.
 
 Чего мы добились (Резюме практики 6)
