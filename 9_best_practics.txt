@@ -1,0 +1,496 @@
+Практика 9: Production‑Ready CI/CD — рефакторинг, конфигурация, документация и автоматизация
+
+Цель превратить работающий пайплайн в промышленный стандарт: разделить на шаблоны, безопасно хранить конфигурации, публиковать документацию и автоматически реагировать на ошибки.
+
+Базовый проект mini‑crm из практики 8. Все действия выполняются на сервере с GitLab и раннерами (либо локально с доступом к GitLab).
+
+---
+
+Шаг 1. Подготовка репозитория и ветки
+
+1. Перейдите в локальную копию `mini-crm` и создайте ветку `practice-9`:
+   
+   cd ~/mini-crm
+   git checkout -b practice-9
+
+
+2. Создайте необходимые директории:
+   ```bash
+   mkdir -p .gitlab/ci/templates config docs docs/docs scripts
+   ```
+
+3. Зафиксируйте структуру:
+   ```bash
+   git add .gitlab config docs scripts
+   git commit -m "Prepare directory structure for practice 9"
+   git push -u origin practice-9
+   ```
+
+---
+
+Шаг 2. Рефакторинг CI/CD (includes, templates, rules)
+
+2.1. Создаём шаблон для тестов (`.gitlab/ci/templates/test.yml`)
+
+.test_backend_template:
+  stage: test
+  image: python:3.11-slim
+  tags: [docker]
+  services:
+    - postgres:15-alpine
+  variables:
+    POSTGRES_USER: crm
+    POSTGRES_PASSWORD: $DB_PASSWORD
+    POSTGRES_DB: crmdb
+    DATABASE_URL: "postgresql://crm:$DB_PASSWORD@postgres:5432/crmdb"
+  before_script:
+    - apt-get update && apt-get install -y wait-for-it
+    - pip install -r backend/requirements.txt pytest
+    - wait-for-it postgres:5432 --timeout=30
+    - export PYTHONPATH=.
+  script:
+    - pytest -v tests/ --junitxml=tests/report-backend.xml
+  artifacts:
+    when: always
+    paths:
+      - tests/report-backend.xml
+    reports:
+      junit: tests/report-backend.xml
+    expire_in: 1 day
+
+.test_frontend_template:
+  stage: test
+  image: python:3.11-slim
+  tags: [docker]
+  before_script:
+    - pip install -r frontend/requirements.txt pytest
+  script:
+    # Имитируем тест с JUnit (или добавьте реальные тесты фронтенда)
+    - echo '<?xml version="1.0"?><testsuite name="frontend" tests="1"><testcase name="test_dummy"/></testsuite>' > report-frontend.xml
+  artifacts:
+    reports:
+      junit: report-frontend.xml
+    expire_in: 1 day
+
+
+2.2. Шаблон для сборки образов (`.gitlab/ci/templates/build.yml`)
+
+.build_template:
+  stage: build
+  image: docker:latest
+  tags: [docker]
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE/$COMPONENT:$DOCKER_TAG ./$COMPONENT
+    - docker push $CI_REGISTRY_IMAGE/$COMPONENT:$DOCKER_TAG
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_MERGE_REQUEST_IID
+
+
+Смешивать `only/except` и `rules` в одном пайплайне документация GitLab не рекомендует — у них разные дефолты поведения, и потом трудно искать причину, почему джоба запустилась или не запустилась. Поэтому шаблон сборки переводим на `rules`, как и все остальные джобы практики.
+
+2.3. Шаблон для деплоя с окружениями (`.gitlab/ci/templates/deploy.yml`)
+
+.deploy_template:
+  stage: deploy
+  tags: [app-server]   # раннер на целевом сервере
+  before_script:
+    # Расшифровка конфига (реализуем на шаге 3)
+    - docker run --rm -v $PWD:/work -w /work -e SOPS_AGE_KEY -e DEPLOY_ENV ghcr.io/getsops/sops:latest --input-type dotenv --output-type dotenv -d config/$DEPLOY_ENV.env.enc > .env
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - |
+      cat <<EOF > docker-compose.deploy.yml
+      services:
+        db:
+          image: postgres:15-alpine
+          env_file: .env
+        backend:
+          image: $CI_REGISTRY_IMAGE/backend:$DOCKER_TAG
+          env_file: .env
+          depends_on: [db]
+        frontend:
+          image: $CI_REGISTRY_IMAGE/frontend:$DOCKER_TAG
+          ports: ["$DEPLOY_PORT:8000"]
+          environment:
+            API_URL: http://backend:8000
+          depends_on: [backend]
+      EOF
+    - docker compose -f docker-compose.deploy.yml down || true
+    - docker compose -f docker-compose.deploy.yml up -d
+  environment:
+    name: $DEPLOY_ENV
+    url: http://10.0.2.6:$DEPLOY_PORT
+
+
+2.4. Главный файл `.gitlab-ci.yml`
+
+stages:
+  - test
+  - build
+  - deploy
+  - pages
+  - notify
+
+# workflow: rules возвращаем из практики 8: без него GitLab на один MR создаёт два пайплайна (branch + merge request), и обещанной экономии от rules не получается.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+include:
+  - local: '.gitlab/ci/templates/test.yml'
+  - local: '.gitlab/ci/templates/build.yml'
+  - local: '.gitlab/ci/templates/deploy.yml'
+  # include для notify.yml добавим на шаге 5.2, когда этот файл уже создан: include несуществующего локального файла — фатальная ошибка, и пайплайн вообще не стартует.
+
+variables:
+  DOCKER_TAG: $CI_COMMIT_SHORT_SHA
+
+# --- Конкретные джобы ---
+test_backend:
+  extends: .test_backend_template
+  rules:
+    - changes: [ "backend/**/*", "tests/**/*" ]
+
+test_frontend:
+  extends: .test_frontend_template
+  rules:
+    - changes: [ "frontend/**/*" ]
+
+build_backend:
+  extends: .build_template
+  variables:
+    COMPONENT: backend
+  needs: []   # можно запускать без тестов для скорости (но лучше после)
+
+build_frontend:
+  extends: .build_template
+  variables:
+    COMPONENT: frontend
+
+deploy_staging:
+  extends: .deploy_template
+  variables:
+    DEPLOY_ENV: staging
+    DEPLOY_PORT: 8090
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  environment:
+    name: staging
+    url: http://10.0.2.6:8090
+
+deploy_production:
+  extends: .deploy_template
+  variables:
+    DEPLOY_ENV: production
+    DEPLOY_PORT: 80
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+  environment:
+    name: production
+    url: http://10.0.2.6
+
+# Далее добавим pages и notify позже
+
+> **Проверка:** Закоммитьте и отправьте в `practice-9`. Пайплайн должен пройти стадии test и build. Деплой пока не будет работать (нет расшифровки).
+
+---
+Шаг 3. Шифрование конфигов (sops + age)
+3.1. Установка инструментов локально
+
+# Установка age
+sudo apt install age  # Debian/Ubuntu
+# или скачать с github.com/FiloSottile/age
+
+# Установка sops
+wget https://github.com/getsops/sops/releases/download/v3.9.1/sops-v3.9.1.linux.amd64 -O /tmp/sops
+sudo mv /tmp/sops /usr/local/bin/sops && chmod +x /usr/local/bin/sops
+
+
+3.2. Генерация age‑ключа и настройка
+
+# Сгенерируйте ключ (храните в безопасном месте, не коммитьте!)
+age-keygen -o age-key.txt
+# Публичная часть:
+PUBLIC_KEY=$(cat age-key.txt | grep "public key" | awk '{print $4}')
+echo $PUBLIC_KEY
+
+
+3.3. Создание файлов окружения
+
+Создайте `config/staging.env` (не шифрованный):
+DB_PASSWORD=stage_secret_pass
+SECRET_KEY=stage_super_secret_123
+POSTGRES_USER=crm
+POSTGRES_DB=crmdb
+POSTGRES_PASSWORD=stage_secret_pass
+DATABASE_URL=postgresql://crm:stage_secret_pass@db:5432/crmdb
+
+
+`config/production.env`:
+
+DB_PASSWORD=prod_very_strong_password
+SECRET_KEY=prod_very_strong_key_456
+POSTGRES_USER=crm
+POSTGRES_DB=crmdb
+POSTGRES_PASSWORD=prod_very_strong_password
+DATABASE_URL=postgresql://crm:prod_very_strong_password@db:5432/crmdb
+
+
+`POSTGRES_PASSWORD` должна быть равна значению `DB_PASSWORD`: контейнер `postgres:15-alpine` в шаблоне деплоя читает именно `POSTGRES_PASSWORD`, и без неё он не стартует. `DATABASE_URL` нужен по той же причине: иначе бэкенд возьмёт дефолт из кода (`postgresql://crm:secret@db:5432/crmdb`) с другим паролем и не подключится к базе.
+
+
+3.4. Шифрование с sops
+
+cd config
+sops -e -a age1...  staging.env > staging.env.enc   # укажите ваш PUBLIC_KEY
+sops -e -a age1...  production.env > production.env.enc
+rm staging.env production.env   # удаляем незашифрованные
+git add *.enc
+git commit -m "Add encrypted env files for staging and production"
+
+> **Важно:** Сам приватный ключ (`age-key.txt`) никогда не коммитим. В CI/CD мы добавим его как защищённую переменную.
+
+3.5. Переменные CI/CD для дешифровки
+В GitLab (Settings → CI/CD → Variables) добавьте:
+
+| Key            | Value                     | Masked | Protected |
+|----------------|---------------------------|--------|-----------|
+| `SOPS_AGE_KEY` | содержимое `age-key.txt`  | ✔️      | ✔️        |
+| `DB_PASSWORD`  | (любой для тестов)        | ✔️      | ❌         |
+
+> Переменная `DB_PASSWORD` используется для тестов (шаблон `test.yml`). Для деплоя пароль будет взят из расшифрованного `.env`.
+
+> Важно имя переменной: sops читает ключ только из `SOPS_AGE_KEY`, `SOPS_AGE_KEY_FILE` или `SOPS_AGE_KEY_CMD`. Переменную с именем `AGE_KEY` он игнорирует (проверено: если задан только `AGE_KEY`, расшифровка падает с «Failed to get the data key required to decrypt the SOPS file»).
+
+3.6. Модификация шаблона деплоя для расшифровки
+
+В `deploy.yml` измените раздел `before_script`. Раннер использует Docker‑образ, в котором нет `sops`, поэтому расшифровываем отдельным контейнером `ghcr.io/getsops/sops:latest` — ставить sops в образ раннера не нужно.
+
+Рекомендуемый способ (расшифровка через отдельный контейнер):
+
+before_script:
+  - docker run --rm -v $PWD:/work -w /work -e SOPS_AGE_KEY -e DEPLOY_ENV ghcr.io/getsops/sops:latest --input-type dotenv --output-type dotenv -d config/$DEPLOY_ENV.env.enc > .env
+  - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+
+Флаги `--input-type dotenv --output-type dotenv` обязательны: sops определяет формат по расширению файла, а `.enc` ему ни о чём не говорит, и без них расшифровка падает с «Could not unmarshal input data: invalid character 'D'». Нужны именно оба флага — с одним `--input-type`, когда результат идёт в stdout, sops всё равно падает. Альтернатива — называть файлы так, чтобы `.env` было последним расширением (`staging.enc.env`), тогда флаги не нужны.
+
+Про редирект: `> .env` выполняет shell самой джобы, поэтому файл создаётся в её текущем каталоге — это и есть тот каталог, который смонтирован в контейнер как `/work` (поэтому `-v $PWD:/work -w /work`). Писать `> /work/.env` нельзя: каталога `/work` в контейнере джобы нет, он существует только внутри контейнера sops.
+
+> **Важно:** не ставьте sops через pip. Пакет `sops` на PyPI — это старый Python‑проект 1.18 (mozilla/sops), а не getsops/sops 3.x, он несовместим с тем sops, который используется во всей практике. Кастомный образ `deploy-tool` тоже не нужен: готовый контейнер `ghcr.io/getsops/sops` решает задачу без сборки своего образа. Если образ раннера на основе Alpine и хочется поставить sops внутрь него, альтернатива — одна строка `apk add --no-cache sops` в `before_script`.
+
+Итоговый `deploy.yml`:
+
+.deploy_template:
+  stage: deploy
+  tags: [app-server]
+  before_script:
+    - docker run --rm -v $PWD:/work -w /work -e SOPS_AGE_KEY -e DEPLOY_ENV ghcr.io/getsops/sops:latest --input-type dotenv --output-type dotenv -d config/$DEPLOY_ENV.env.enc > .env
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - # ... (как выше)
+
+
+---
+
+Шаг 4. Документация MkDocs + GitLab Pages
+
+4.0. Предусловие: включаем Pages на self‑managed GitLab
+
+На своём (self‑managed) GitLab Pages по умолчанию не работает, поэтому сначала его нужно включить: в `/etc/gitlab/gitlab.rb` задайте `pages_external_url` (например, `http://pages.gitlab.local`) и настройте wildcard‑DNS для этого домена. Второй вариант — одно‑доменный режим: тот же `pages_external_url` плюс `gitlab_pages['namespace_in_path'] = true`. После правки выполните `sudo gitlab-ctl reconfigure`. Без этого джоба `pages` ничего не опубликует, и адреса `.../pages/` просто не будет.
+
+4.1. Инициализация MkDocs
+
+cd ~/mini-crm
+pip install mkdocs
+mkdocs new docs
+
+
+Структура:
+
+docs/
+├── mkdocs.yml
+└── docs/
+    ├── index.md
+    └── ...
+
+
+Файл `mkdocs.yml` уже создан в `docs/` командой выше — отредактируйте `docs/mkdocs.yml`:
+
+site_name: Mini CRM Documentation
+nav:
+  - Home: index.md
+  - API Reference: api.md
+  - Deployment: deployment.md
+
+Создайте страницы (`docs/docs/index.md` и др.).
+
+4.2. Генерация OpenAPI спецификации из FastAPI (опционально)
+
+# В виртуальном окружении проекта (нужны зависимости из backend/requirements.txt)
+python -c "import json, sys; sys.path.insert(0, 'backend'); from app import app; print(json.dumps(app.openapi(), ensure_ascii=False, indent=2))" > docs/docs/openapi.json
+
+Спецификация берётся прямо из объекта приложения, поэтому отдельный CLI не нужен. У `fastapi-cli` (исполняемый файл `fastapi`) есть только две подкоманды — `dev` и `run`; команды `fastapi-cli openapi` не существует.
+
+
+4.3. Добавление джобы `pages` в `.gitlab-ci.yml`
+
+Добавим в корневой `.gitlab-ci.yml` новую стадию `pages` (уже объявлена). И саму джобу:
+
+pages:
+  stage: pages
+  image: python:3.11-slim
+  tags: [docker]
+  before_script:
+    - pip install mkdocs
+  script:
+    - cd docs && mkdocs build --site-dir public
+  pages:
+    publish: docs/public
+  artifacts:
+    paths:
+      - docs/public
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+
+По умолчанию GitLab Pages публикует каталог `public`, поэтому одних `artifacts: paths` недостаточно — нужный каталог задаёт `pages.publish` (в GitLab 17.10+ он сам добавляется в artifacts, а `artifacts: paths` оставлен для совместимости со старыми версиями).
+
+После успешного пайплайна документация будет доступна по адресу:  
+`https://gitlab.local/root/mini-crm/pages/` (или аналогичный).
+
+Шаг 5. Автоматическое создание issue при падении пайплайна
+
+5.1. Скрипт `scripts/create_failure_issue.py`
+
+#!/usr/bin/env python3
+import os
+import sys
+import requests
+import json
+
+# Переменные окружения от GitLab CI
+GITLAB_URL = os.getenv("CI_API_V4_URL")
+PROJECT_ID = os.getenv("CI_PROJECT_ID")
+PIPELINE_ID = os.getenv("CI_PIPELINE_ID")
+API_TOKEN = os.getenv("GITLAB_API_TOKEN")
+
+if not all([GITLAB_URL, PROJECT_ID, PIPELINE_ID, API_TOKEN]):
+    print("Missing required environment variables")
+    sys.exit(1)
+
+# Получаем информацию о пайплайне
+headers = {"PRIVATE-TOKEN": API_TOKEN}
+pipeline_url = f"{GITLAB_URL}/projects/{PROJECT_ID}/pipelines/{PIPELINE_ID}"
+resp = requests.get(pipeline_url, headers=headers)
+if resp.status_code != 200:
+    print(f"Failed to get pipeline: {resp.text}")
+    sys.exit(1)
+pipeline = resp.json()
+pipeline_status = pipeline.get("status")
+pipeline_url_web = pipeline.get("web_url")
+
+# Получаем упавшие джобы
+jobs_url = f"{GITLAB_URL}/projects/{PROJECT_ID}/pipelines/{PIPELINE_ID}/jobs"
+jobs = requests.get(jobs_url, headers=headers).json()
+failed_jobs = [j for j in jobs if j.get("status") == "failed"]
+
+if not failed_jobs:
+    print("No failed jobs, exiting")
+    sys.exit(0)
+
+# Формируем тело issue
+title = f"[CI] Pipeline #{PIPELINE_ID} failed on {pipeline_status}"
+body = f"Pipeline: {pipeline_url_web}\n\nFailed jobs:\n"
+for job in failed_jobs:
+    job_name = job.get("name")
+    job_url = job.get("web_url")
+    body += f"- {job_name}: {job_url}\n"
+    # Попробуем получить трейс лога (первые 500 символов)
+    trace_url = f"{GITLAB_URL}/projects/{PROJECT_ID}/jobs/{job.get('id')}/trace"
+    trace_resp = requests.get(trace_url, headers=headers)
+    if trace_resp.status_code == 200:
+        trace = trace_resp.text[:500]  # ограничим
+        body += f"\n```\n{trace}\n```\n"
+
+# Создаём issue
+issue_url = f"{GITLAB_URL}/projects/{PROJECT_ID}/issues"
+payload = {"title": title, "description": body}
+r = requests.post(issue_url, headers=headers, json=payload)
+if r.status_code == 201:
+    print(f"Issue created: {r.json().get('web_url')}")
+else:
+    print(f"Failed to create issue: {r.text}")
+    sys.exit(1)
+
+5.2. Добавление CI‑джобы `on_failure`
+Создайте шаблон `.gitlab/ci/templates/notify.yml`:
+
+# .gitlab/ci/templates/notify.yml
+create_failure_issue:
+  stage: notify
+  image: python:3.11-slim
+  tags: [docker]
+  variables:
+    REQUESTS_CA_BUNDLE: $CI_SERVER_TLS_CA_FILE
+  before_script:
+    - pip install requests
+  script:
+    - python scripts/create_failure_issue.py
+  when: on_failure
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+В контейнере `python:3.11-slim` нет нашего самоподписанного CA, и `requests` к `https://gitlab.local/api/v4` упал бы с SSL‑ошибкой. Раннер сам выкладывает этот CA в файл `$CI_SERVER_TLS_CA_FILE`, а переменная `REQUESTS_CA_BUNDLE` указывает библиотеке `requests` использовать его.
+
+Теперь файл `notify.yml` создан — добавьте в главный `.gitlab-ci.yml` строку `- local: '.gitlab/ci/templates/notify.yml'` в блок `include` (в шаге 2 мы её специально не добавляли).
+
+5.3. Переменная `GITLAB_API_TOKEN`
+
+В GitLab CI/CD Variables добавьте:
+
+| Key                 | Value                               | Masked |
+|---------------------|-------------------------------------|--------|
+| `GITLAB_API_TOKEN`  | Personal Access Token (api scope)   | ✔️     |
+
+> Создайте токен в GitLab: Profile → Access Tokens → `api` и `write_repository`.
+
+---
+
+Шаг 6. Финальная интеграция и тестирование
+
+1. **Соберите все изменения в ветке `practice-9`:**
+   git add .gitlab config docs scripts
+   git commit -m "Add templates, encrypted configs, docs, failure issue script"
+   git push origin practice-9
+   
+
+2. Создайте Merge Request из `practice-9` в `main`.  
+   - Пайплайн запустит тесты, сборку и деплой staging: деплой идёт только из `main` (правило `if: $CI_COMMIT_BRANCH == "main"`), защищённость ветки тут ни при чём.  
+   - Проверьте, что staging поднялся, документация опубликовалась.
+
+3. Намеренно сломайте пайплайн (например, внесите синтаксическую ошибку в `backend/app.py` и запушите в `main`).  
+   - Убедитесь, что после падения создаётся issue с описанием упавших джоб.
+
+4. Проверьте деплой с расшифрованным `.env`:  
+   - Зайдите на целевой сервер `10.0.2.6`, выполните `docker compose -f ... ps`.  
+   - Убедитесь, что контейнеры используют переменные из расшифрованного `.env`: например, `docker compose -f docker-compose.deploy.yml exec backend env | sort`.
+   - Учтите: значения из `.env` действительно попадают в контейнеры, но `docker inspect` их показывает — он выводит `Config.Env` контейнера, включая всё, что пришло из `env_file`. Чтобы секреты не были видны, нужны docker secrets или внешний секрет‑стор.
+
+5. Закройте MR после успешного ревью.
+
+---
+
+## Итоговые навыки и критерии успеха
+
+- CI/CD пайплайн разбит на переиспользуемые шаблоны, использует `rules` для экономии.
+- Конфигурации окружений зашифрованы в репозитории, расшифровываются только на целевых серверах.
+- Документация автоматически публикуется в GitLab Pages.
+- При падении пайплайна в `main` автоматически создаётся issue с деталями ошибки.
+- Все джобы используют минимально необходимые права и не содержат секретов в логах.
+
+Поздравляю! Вы построили промышленный CI/CD процесс.
