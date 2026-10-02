@@ -388,8 +388,8 @@ CMD ["./server"]
 Alpine — это минималистичный Linux. Уязвимости в нём лечатся одной командой `apk upgrade`.
 
 Новый `web-ui/Dockerfile`:
-# Этап 1: Сборка - обновляем Go с 1.21 до 1.24 (в нём закрыты критические уязвимости)
-FROM golang:1.24-alpine AS builder
+# Этап 1: Сборка - обновляем Go с 1.21 до 1.27 (в нём закрыты критические уязвимости)
+FROM golang:1.27-alpine AS builder
 WORKDIR /app
 COPY main.go .
 RUN CGO_ENABLED=0 GOOS=linux go build -o server main.go

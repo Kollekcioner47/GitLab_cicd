@@ -206,9 +206,12 @@ docker compose up app
 1. Добавьте сертификат GitLab в доверенные для локального Docker-демона (чтобы он мог пушить образы):
 
 sudo mkdir -p /etc/docker/certs.d/gitlab.local:5050
+sudo mkdir -p /etc/docker/certs.d/gitlab.local:443
 sudo cp /etc/gitlab/ssl/gitlab.local.crt /etc/docker/certs.d/gitlab.local:5050/ca.crt
+sudo cp /etc/gitlab/ssl/gitlab.local.crt /etc/docker/certs.d/gitlab.local:443/ca.crt
 sudo systemctl restart docker
 
+#Так же для второго узла
 Пояснение: TLS-соединение с реестром устанавливает демон Docker, а не CLI-клиент. Поэтому сертификат нужен именно на хосте, в каталоге /etc/docker/certs.d/gitlab.local:5050/ca.crt. Системное хранилище CA (/usr/local/share/ca-certificates + update-ca-certificates) Docker для работы с реестрами не использует — добавление сертификата только туда проблему не решит.
 
 2. Настройте GitLab Runner на использование сокета хоста. Откройте конфигурацию раннера:
